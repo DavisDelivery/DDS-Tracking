@@ -120,11 +120,19 @@ exports.handler = async (event) => {
     //   Delivered (90) and Exception (50) come straight from the stop.
     //   Otherwise, if the load is rolling (status 40 + a real start time),
     //   show "Out for Delivery". Everything else is "Scheduled".
+    // A confirmed delivery time is the ground truth that the stop was worked,
+    // even when the status code wasn't set through the normal driver flow.
+    const confirmed = (exe.to && exe.to.confirmedDTTM) || "";
     let displayStatus;
-    if (rawStopStatus === "90") {
+    if (rawStopStatus === "90" || rawStopStatus === "91") {
+      // 90 = driver-confirmed delivered; 91 = manually completed by dispatch.
       displayStatus = "90";
     } else if (rawStopStatus === "50") {
       displayStatus = "50";
+    } else if (confirmed && !exe.exceptionPresent) {
+      // Safety net: any other completion path (e.g. status 80) that still
+      // stamped a delivery confirmation time counts as delivered.
+      displayStatus = "90";
     } else if (loadStatus === "40" && loadStarted) {
       displayStatus = "40";
     } else {
