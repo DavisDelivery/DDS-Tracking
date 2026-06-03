@@ -1,7 +1,28 @@
 const fetch = require("node-fetch");
 
-const REVIEW_EMAIL = process.env.REVIEW_EMAIL || "Chad@davisdelivery.com";
+// Resend's shared onboarding@resend.dev sender only delivers to the Resend
+// account owner's address, and matches it case-sensitively — so normalize to
+// lowercase (a capital-C "Chad@..." was being rejected with HTTP 403, which is
+// why no alert emails were going out). To email recipients other than the
+// owner, verify a domain at resend.com/domains and set REVIEW_FROM to an
+// address on that domain.
+const REVIEW_EMAIL = (process.env.REVIEW_EMAIL || "chad@davisdelivery.com").trim().toLowerCase();
+const MAIL_FROM = process.env.REVIEW_FROM || "Davis Delivery Alerts <onboarding@resend.dev>";
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
+// Netlify Blobs store, resilient across deploy methods. Uses explicit
+// credentials when provided (set NETLIFY_SITE_ID + NETLIFY_BLOBS_TOKEN), and
+// otherwise falls back to the deploy context auto-injected by Netlify's build.
+// Strong consistency so the admin dashboard reflects writes immediately.
+function reviewsStore() {
+  const { getStore } = require("@netlify/blobs");
+  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+  const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_API_TOKEN;
+  if (siteID && token) {
+    return getStore({ name: "reviews", siteID, token, consistency: "strong" });
+  }
+  return getStore({ name: "reviews", consistency: "strong" });
+}
 
 exports.handler = async (event) => {
   const headers = {
@@ -22,8 +43,7 @@ exports.handler = async (event) => {
       return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
     }
     try {
-      const { getStore } = require("@netlify/blobs");
-      const store = getStore("reviews");
+      const store = reviewsStore();
       const list = await store.list();
       const reviews = [];
       for (const blob of list.blobs) {
@@ -34,7 +54,9 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers, body: JSON.stringify({ reviews }) };
     } catch (err) {
       console.error("Fetch reviews error:", err);
-      return { statusCode: 500, headers, body: JSON.stringify({ error: "Fetch failed" }) };
+      // Surface the real reason (instead of a generic message) to make Blobs
+      // misconfiguration diagnosable from the dashboard/network tab.
+      return { statusCode: 500, headers, body: JSON.stringify({ error: "Fetch failed", detail: err.message }) };
     }
   }
 
@@ -69,8 +91,7 @@ exports.handler = async (event) => {
 
   // Store in Netlify Blobs
   try {
-    const { getStore } = require("@netlify/blobs");
-    const store = getStore("reviews");
+    const store = reviewsStore();
     await store.setJSON(review.id, review);
   } catch (err) {
     console.error("Blob storage error:", err);
@@ -86,7 +107,7 @@ exports.handler = async (event) => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          from: "Davis Delivery Alerts <onboarding@resend.dev>",
+          from: MAIL_FROM,
           to: REVIEW_EMAIL,
           reply_to: REVIEW_EMAIL,
           subject: `⚠️ ${rating}-Star Review — PRO# ${review.proNumber || "Unknown"}`,
