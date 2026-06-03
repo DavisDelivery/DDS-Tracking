@@ -246,6 +246,51 @@ exports.handler = async (event) => {
     }
   }
 
+  // Heads-up on 5-star reviews too — not just route to Google silently — so
+  // the owner sees the win in real time. (4-star still routes to Google with
+  // no email; ≤3-star sends the alert above.)
+  if (rating === 5 && RESEND_API_KEY) {
+    try {
+      const posRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: MAIL_FROM,
+          to: REVIEW_EMAIL,
+          reply_to: REVIEW_EMAIL,
+          subject: `⭐ 5-Star Review — PRO# ${review.proNumber || "Unknown"}`,
+          html: `
+            <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+              <div style="background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:20px;border-radius:8px;margin-bottom:16px">
+                <h1 style="margin:0;font-size:20px">⭐ 5-Star Review</h1>
+                <div style="font-size:13px;opacity:.8;margin-top:4px">Davis Delivery Tracking Portal</div>
+              </div>
+              <div style="background:#fff;padding:20px;border:1px solid #dde2e8;border-radius:8px">
+                <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">★★★★★</div>
+                <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
+                <p style="margin:6px 0"><strong>Name:</strong> ${review.name || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
+                ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
+                <p style="color:#666;font-size:12px;margin:4px 0">✅ The customer was also routed to leave this review on Google.</p>
+                <p style="color:#666;font-size:12px;margin:4px 0">📊 <a href="https://davisdeliverytracking.netlify.app/admin" style="color:#1e5b92">View full dashboard</a></p>
+              </div>
+            </div>
+          `,
+        }),
+      });
+      if (!posRes.ok) {
+        console.error("5-star email error:", await posRes.json());
+      }
+    } catch (err) {
+      console.error("5-star email send error:", err);
+    }
+  }
+
   const googleReviewUrl = "https://g.page/r/CcBkxtEUiFOGEAE/review";
 
   return {
