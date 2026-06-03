@@ -108,7 +108,7 @@ function reviewsStore() {
 exports.handler = async (event) => {
   const headers = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Content-Type": "application/json",
   };
@@ -119,9 +119,23 @@ exports.handler = async (event) => {
 
   // GET = fetch reviews for the dashboards
   if (event.httpMethod === "GET") {
-    const pwd = (event.queryStringParameters || {}).key;
+    const q = event.queryStringParameters || {};
+    const pwd = q.key;
     if (pwd !== (process.env.DASHBOARD_KEY || "davis2026")) {
       return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
+    }
+    // Diagnostic: confirm notification wiring without exposing any secret value.
+    if (q.diag === "1") {
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          resendConfigured: !!RESEND_API_KEY,
+          reviewEmail: REVIEW_EMAIL,
+          mailFrom: MAIL_FROM,
+          nuvizzDavisConfigured: !!DAVIS_PASS,
+        }),
+      };
     }
     try {
       const store = reviewsStore();
@@ -154,6 +168,37 @@ exports.handler = async (event) => {
     } catch (err) {
       console.error("Fetch reviews error:", err);
       return { statusCode: 500, headers, body: JSON.stringify({ error: "Fetch failed", detail: err.message }) };
+    }
+  }
+
+  // DELETE = remove one or more reviews by id (key-gated). Used to purge test
+  // records. ids may be a comma-separated list in ?id= or the JSON body.
+  if (event.httpMethod === "DELETE") {
+    const q = event.queryStringParameters || {};
+    if (q.key !== (process.env.DASHBOARD_KEY || "davis2026")) {
+      return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
+    }
+    let ids = [];
+    if (q.id) ids = String(q.id).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!ids.length && event.body) {
+      try {
+        const b = JSON.parse(event.body);
+        if (Array.isArray(b.ids)) ids = b.ids;
+        else if (b.id) ids = [b.id];
+      } catch { /* ignore */ }
+    }
+    if (!ids.length) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing id" }) };
+    }
+    try {
+      const store = reviewsStore();
+      const deleted = [];
+      for (const id of ids) {
+        try { await store.delete(id); deleted.push(id); } catch (e) { /* skip */ }
+      }
+      return { statusCode: 200, headers, body: JSON.stringify({ deleted }) };
+    } catch (err) {
+      return { statusCode: 500, headers, body: JSON.stringify({ error: "Delete failed", detail: err.message }) };
     }
   }
 
