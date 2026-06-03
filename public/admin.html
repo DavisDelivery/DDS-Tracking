@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reviews Dashboard | Davis Delivery</title>
+<meta name="robots" content="noindex, nofollow">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'DM Sans',system-ui,sans-serif;background:#f8f9fb;color:#1f2937;min-height:100vh}
+.wrap{max-width:960px;margin:0 auto;padding:24px 20px}
+.header{background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:24px;border-radius:12px;margin-bottom:20px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:#fff;border:1px solid #dde2e8;border-radius:10px;padding:14px}
+.stat-val{font-size:28px;font-weight:800;font-family:'Plus Jakarta Sans',sans-serif;color:#0a2744}
+.stat-lbl{font-size:10px;font-weight:700;color:#97a3b3;text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
+.login{background:#fff;border:1px solid #dde2e8;border-radius:12px;padding:32px;max-width:400px;margin:60px auto;text-align:center}
+.login input{width:100%;padding:12px;font-size:15px;border:1px solid #dde2e8;border-radius:8px;margin:16px 0;font-family:inherit}
+.login button{width:100%;padding:12px;background:#e8a838;color:#0a2744;border:none;border-radius:8px;font-weight:800;cursor:pointer;font-size:14px}
+.review{background:#fff;border:1px solid #dde2e8;border-radius:10px;padding:16px;margin-bottom:12px}
+.review.google{border-left:4px solid #1a9e5c}
+.review.internal{border-left:4px solid #d63b3b}
+.review-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+.stars{color:#e8a838;font-size:18px;letter-spacing:2px}
+.tag{display:inline-block;padding:3px 10px;border-radius:12px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.tag-google{background:#1a9e5c15;color:#1a9e5c}
+.tag-internal{background:#d63b3b15;color:#d63b3b}
+.comment{color:#5a6779;font-size:14px;line-height:1.5;margin:10px 0;padding:10px;background:#f8f9fb;border-radius:6px}
+.meta{font-size:12px;color:#97a3b3}
+.meta strong{color:#5a6779;font-weight:600}
+.empty{text-align:center;padding:80px 20px;color:#97a3b3}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="content">
+    <div class="login" id="login">
+      <h2 style="font-family:'Plus Jakarta Sans',sans-serif;color:#0a2744">Reviews Dashboard</h2>
+      <p style="color:#97a3b3;font-size:13px;margin-top:6px">Enter dashboard key to access reviews</p>
+      <input type="password" id="key" placeholder="Dashboard key" autofocus>
+      <button onclick="login()">Sign In</button>
+      <p id="err" style="color:#d63b3b;font-size:12px;margin-top:10px"></p>
+    </div>
+  </div>
+</div>
+<script>
+async function login(){
+  const key=document.getElementById("key").value;
+  if(!key){document.getElementById("err").textContent="Please enter key";return}
+  try{
+    const res=await fetch("/.netlify/functions/review?key="+encodeURIComponent(key));
+    if(!res.ok){document.getElementById("err").textContent="Invalid key";return}
+    const data=await res.json();
+    localStorage.setItem("dk",key);
+    renderDashboard(data.reviews||[]);
+  }catch(e){document.getElementById("err").textContent="Connection error"}
+}
+function logout(){localStorage.removeItem("dk");location.reload()}
+function star(n){return"★".repeat(n)+"☆".repeat(5-n)}
+function fmtDate(iso){return new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",timeZone:"America/New_York"})}
+function renderDashboard(reviews){
+  const googleCount=reviews.filter(r=>r.routedTo==="google").length;
+  const internalCount=reviews.filter(r=>r.routedTo==="internal").length;
+  const avg=reviews.length?(reviews.reduce((s,r)=>s+r.rating,0)/reviews.length).toFixed(1):"—";
+  let html=`
+    <div class="header">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <div>
+          <h1 style="font-family:'Plus Jakarta Sans',sans-serif;font-size:24px">Reviews Dashboard</h1>
+          <p style="color:rgba(255,255,255,.6);font-size:13px;margin-top:2px">Davis Delivery Tracking Portal</p>
+        </div>
+        <button onclick="logout()" style="padding:8px 16px;background:rgba(255,255,255,.1);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:8px;cursor:pointer;font-size:12px;font-weight:600">Sign out</button>
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat"><div class="stat-val">${reviews.length}</div><div class="stat-lbl">Total Reviews</div></div>
+      <div class="stat"><div class="stat-val">${avg}</div><div class="stat-lbl">Avg Rating</div></div>
+      <div class="stat"><div class="stat-val" style="color:#1a9e5c">${googleCount}</div><div class="stat-lbl">→ Google</div></div>
+      <div class="stat"><div class="stat-val" style="color:#d63b3b">${internalCount}</div><div class="stat-lbl">Internal Only</div></div>
+    </div>
+  `;
+  if(!reviews.length){
+    html+='<div class="empty"><div style="font-size:48px;margin-bottom:12px">⭐</div><div style="font-size:15px;color:#5a6779;font-weight:600">No reviews yet</div><div style="font-size:12px;margin-top:4px">Reviews submitted by customers will appear here</div></div>';
+  } else {
+    html+=reviews.map(r=>`
+      <div class="review ${r.routedTo}">
+        <div class="review-head">
+          <div>
+            <div class="stars">${star(r.rating)}</div>
+            <div style="font-size:13px;color:#5a6779;margin-top:3px"><strong>${r.name||"Anonymous"}</strong>${r.contact?" · "+r.contact:""}</div>
+          </div>
+          <span class="tag ${r.routedTo==="google"?"tag-google":"tag-internal"}">${r.routedTo==="google"?"Sent to Google":"Internal Only"}</span>
+        </div>
+        ${r.comment?`<div class="comment">${r.comment.replace(/</g,"&lt;")}</div>`:""}
+        <div class="meta">PRO# <strong>${r.proNumber||"—"}</strong> · ${fmtDate(r.submittedAt)}</div>
+      </div>
+    `).join("");
+  }
+  document.getElementById("content").innerHTML=html;
+}
+// Auto-login if key saved
+const savedKey=localStorage.getItem("dk");
+if(savedKey){
+  document.getElementById("key").value=savedKey;
+  login();
+}
+document.getElementById("key")?.addEventListener("keydown",e=>{if(e.key==="Enter")login()});
+</script>
+</body>
+</html>
