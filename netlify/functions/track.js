@@ -117,9 +117,12 @@ exports.handler = async (event) => {
     }
 
     // Compute the status the customer actually sees.
-    //   Delivered (90) and Exception (50) come straight from the stop.
-    //   Otherwise, if the load is rolling (status 40 + a real start time),
-    //   show "Out for Delivery". Everything else is "Scheduled".
+    // NuVizz stop status codes (v7 docs): 50 = "Arrived at DropOff" — the
+    // driver is AT the customer's door, NOT an exception. Exceptions are a
+    // separate flag (exceptionPresent), never a status code.
+    // Display codes sent to the frontend:
+    //   90 Delivered · 50 Exception · 45 Driver Arrived · 40 Out for Delivery
+    //   30 Scheduled
     // A confirmed delivery time is the ground truth that the stop was worked,
     // even when the status code wasn't set through the normal driver flow.
     const confirmed = (exe.to && exe.to.confirmedDTTM) || "";
@@ -127,13 +130,16 @@ exports.handler = async (event) => {
     if (rawStopStatus === "90" || rawStopStatus === "91") {
       // 90 = driver-confirmed delivered; 91 = manually completed by dispatch.
       displayStatus = "90";
-    } else if (rawStopStatus === "50") {
-      displayStatus = "50";
     } else if (confirmed && !exe.exceptionPresent) {
       // Safety net: any other completion path (e.g. status 80) that still
       // stamped a delivery confirmation time counts as delivered.
       displayStatus = "90";
-    } else if (loadStatus === "40" && loadStarted) {
+    } else if (exe.exceptionPresent) {
+      displayStatus = "50";
+    } else if (rawStopStatus === "50") {
+      displayStatus = "45";
+    } else if (rawStopStatus === "38" || (loadStatus === "40" && loadStarted)) {
+      // 38 = enroute to destination; otherwise infer from the rolling load.
       displayStatus = "40";
     } else {
       displayStatus = "30";
