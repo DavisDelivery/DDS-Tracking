@@ -68,12 +68,16 @@ async function resolveDriver(rawPro) {
     }
     if (!stopData) return { driver: "", driverId: "" };
 
-    // Try the stop-level execution info first.
+    // The assigned driver rides on the load object embedded in the stop
+    // response (load.driverName / load.driverId) — check there first, then
+    // the stop-level execution info.
     const exe = stopData.stopExecutionInfo || {};
-    let driver = firstVal(exe, ["driverName", "driver.driverName", "driver.name", "assignedDriver"]);
-    let driverId = firstVal(exe, ["driverId", "driver.driverId", "driver.id"]);
+    let driver = firstVal(load, ["driverName", "driver.driverName", "driver.name"]) ||
+      firstVal(exe, ["driverName", "driver.driverName", "driver.name", "assignedDriver"]);
+    let driverId = firstVal(load, ["driverId", "driver.driverId", "driver.id"]) ||
+      firstVal(exe, ["driverId", "driver.driverId", "driver.id"]);
 
-    // Fall back to the load — the assigned driver lives on the route header.
+    // Fall back to a load/info call — the assigned driver lives on the route header.
     if ((!driver || !driverId) && load && load.loadNbr) {
       const r = await fetch(`${NUVIZZ_BASE}/load/info/${load.loadNbr}/DAVIS`, {
         headers: { Authorization: davisAuth },
@@ -146,19 +150,25 @@ exports.handler = async (event) => {
         if (data) reviews.push(data);
       }
 
-      // Lazy backfill: attribute any review that predates driver capture (or
-      // whose earlier lookup failed). Bounded per request so a big backlog
-      // can't time the function out — the rest fill in on subsequent loads.
+      // Lazy backfill: attribute any review that predates driver capture or
+      // whose earlier lookup came back empty (bounded retries so permanently
+      // unresolvable PROs don't hit NuVizz forever). Bounded per request so a
+      // big backlog can't time the function out — the rest fill in on
+      // subsequent loads.
       const backfillCap = 8;
+      const maxAttempts = 3;
       let backfilled = 0;
       for (const rv of reviews) {
         if (backfilled >= backfillCap) break;
-        if (rv.driverResolved) continue;
+        const attempts = rv.driverAttempts || 0;
+        if (rv.driverResolved && rv.driver) continue;
+        if (rv.driverResolved && attempts >= maxAttempts) continue;
         if (!rv.proNumber) { rv.driver = rv.driver || ""; rv.driverResolved = true; continue; }
         const { driver, driverId } = await resolveDriver(rv.proNumber);
         rv.driver = driver;
         rv.driverId = driverId;
         rv.driverResolved = true;
+        rv.driverAttempts = attempts + 1;
         try { await store.setJSON(rv.id, rv); } catch (e) { /* non-fatal */ }
         backfilled++;
       }
@@ -235,6 +245,7 @@ exports.handler = async (event) => {
     driver: driver || "",
     driverId: driverId || "",
     driverResolved: true,
+    driverAttempts: 1,
     submittedAt: new Date().toISOString(),
     routedTo: rating >= 4 ? "google" : "internal",
   };
