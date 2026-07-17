@@ -69,7 +69,7 @@ const API_BASE=window.location.origin;
 function fD(i){if(!i)return"—";try{return new Date(i).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric",timeZone:"America/New_York"})}catch{return i}}
 function fT(i){if(!i)return"";try{return new Date(i).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})}catch{return i}}
 function fDT(i){return i?fD(i)+" at "+fT(i):"—"}
-function fEW(i){if(!i)return"—";try{var d=new Date(i),s=new Date(d.getTime()-30*60000),e=new Date(d.getTime()+90*60000);var f=function(t){return t.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})};return f(s)+" – "+f(e)}catch{return i}}
+function fEW(i){if(!i)return"—";try{var M=15*60000,r=function(t){return new Date(Math.round(t/M)*M)},d=new Date(i),s=r(d.getTime()-30*60000),e=r(d.getTime()+90*60000);var f=function(t){return t.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})};return f(s)+" – "+f(e)}catch{return i}}
 function fPh(p){if(!p)return"";var c=p.replace(/\D/g,"");return c.length===10?"("+c.slice(0,3)+") "+c.slice(3,6)+"-"+c.slice(6):p}
 function sL(c){return c==="90"?"Delivered":c==="45"?"Driver Arrived":c==="40"?"Out for Delivery":c==="50"?"Exception":"Scheduled"}
 function sC(c){return c==="90"?B.green:c==="45"?B.blue:c==="40"?B.accent:c==="50"?B.red:B.g400}
