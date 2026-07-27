@@ -6,6 +6,73 @@ const ULINE_USER = process.env.NUVIZZ_ULINE_USER || "Chad";
 const ULINE_PASS = process.env.NUVIZZ_ULINE_PASS;
 const BASE = "https://portal.nuvizz.com/deliverit/openapi/v7";
 
+// Davis runs Eastern time. NuVizz returns wall-clock timestamps with no zone
+// ("2026-07-27T12:13:09"), which JS would otherwise read against the running
+// container's clock — UTC on Netlify — putting every ETA four hours out.
+const ROUTE_TZ = "America/New_York";
+
+const TZ_PARTS = new Intl.DateTimeFormat("en-US", {
+  timeZone: ROUTE_TZ, hour12: false,
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+
+// How far ROUTE_TZ sits from UTC at a given instant (DST-aware).
+function tzOffsetMs(utcMs) {
+  const p = {};
+  for (const part of TZ_PARTS.formatToParts(new Date(utcMs))) p[part.type] = part.value;
+  const wall = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+  return wall - utcMs;
+}
+
+// Parse a NuVizz timestamp to epoch ms, treating zone-less values as ROUTE_TZ.
+function parseRouteTime(s) {
+  if (!s) return null;
+  const str = String(s);
+  if (/[Zz]|[+-]\d{2}:?\d{2}$/.test(str)) {
+    const t = Date.parse(str);
+    return Number.isFinite(t) ? t : null;
+  }
+  const m = str.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const asUTC = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  // Two passes so instants near a DST boundary resolve to the right offset.
+  const once = asUTC - tzOffsetMs(asUTC);
+  return asUTC - tzOffsetMs(once);
+}
+
+// Guard rails for the drift correction below. A stop dispatch never closed out
+// would otherwise read as a driver days behind schedule, so ignore stops whose
+// ETA is implausibly old, and never project a delay beyond a working day.
+const STALE_STOP_MS = 12 * 60 * 60 * 1000;
+const MAX_SLIP_MS = 6 * 60 * 60 * 1000;
+
+// Warm-container cache for load lookups. Every viewer of a given route pulls
+// the same load payload, and it changes only as the driver works stops, so a
+// short shared TTL removes the redundant round trip per viewer.
+const LOAD_CACHE_TTL_MS = 60 * 1000;
+const LOAD_CACHE_MAX = 200;
+const loadCache = new Map();
+
+function getCachedLoad(loadNbr) {
+  const hit = loadCache.get(loadNbr);
+  if (!hit) return null;
+  if (Date.now() - hit.at > LOAD_CACHE_TTL_MS) {
+    loadCache.delete(loadNbr);
+    return null;
+  }
+  return hit.data;
+}
+
+function setCachedLoad(loadNbr, data) {
+  // Bounded; Map preserves insertion order so the oldest key evicts first.
+  if (loadCache.size >= LOAD_CACHE_MAX) {
+    const oldest = loadCache.keys().next().value;
+    if (oldest !== undefined) loadCache.delete(oldest);
+  }
+  loadCache.set(loadNbr, { at: Date.now(), data });
+}
+
 exports.handler = async (event) => {
   const headers = {
     "Access-Control-Allow-Origin": "*",
@@ -82,13 +149,20 @@ exports.handler = async (event) => {
     let loadStarted = false;
     let stopsAway = null;
     let stopsOnRoute = 0;
+    let latenessMs = 0;
     if (load && load.loadNbr) {
       try {
-        const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/DAVIS`, {
-          headers: { Authorization: `Basic ${davisAuth}` },
-        });
-        if (loadRes.ok) {
-          const loadData = await loadRes.json();
+        let loadData = getCachedLoad(load.loadNbr);
+        if (!loadData) {
+          const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/DAVIS`, {
+            headers: { Authorization: `Basic ${davisAuth}` },
+          });
+          if (loadRes.ok) {
+            loadData = await loadRes.json();
+            setCachedLoad(load.loadNbr, loadData);
+          }
+        }
+        if (loadData) {
           const lexe = (loadData.Load && loadData.Load.loadExecutionInfo) || {};
           loadStatus = lexe.loadStatus || "";
           loadStarted = !!lexe.actualStartDTTM;
@@ -164,10 +238,8 @@ exports.handler = async (event) => {
             const n = Number(v);
             return Number.isFinite(n) ? n : null;
           };
-          const etaOf = (s) => {
-            const t = Date.parse(((s.stopExecutionInfo || {}).to || {}).etaDttm || "");
-            return Number.isFinite(t) ? t : null;
-          };
+          const etaOf = (s) =>
+            parseRouteTime(((s.stopExecutionInfo || {}).to || {}).etaDttm || "");
           const distinct = (fn) =>
             new Set(stops.map(fn).filter((v) => v !== null)).size;
 
@@ -201,6 +273,32 @@ exports.handler = async (event) => {
           // Leave stopsAway null when the stop can't be located on the route —
           // "unknown" must not be reported to the customer as "you're next".
           stopsAway = foundTarget ? undeliveredBefore : null;
+
+          // Measure how far the route has slipped.
+          //
+          // NuVizz gives one ETA per stop and does not visibly re-forecast when
+          // a driver falls behind — the remaining ETAs just go stale into the
+          // past. The earliest stop still awaiting delivery is where the route
+          // actually stands, so how far its ETA has fallen behind now is the
+          // running delay, which we carry forward to the stops after it.
+          //
+          // This is self-cancelling: when the driver is on time (or NuVizz does
+          // re-forecast) the gap is zero and no adjustment is applied.
+          const nowMs = Date.now();
+          const pendingEtas = ordered
+            .filter((s) => {
+              const sExe = s.stopExecutionInfo || {};
+              return (s.stop || {}).stopType === "DO" &&
+                !isDone(sExe) &&
+                !sExe.exceptionPresent;
+            })
+            .map(etaOf)
+            .filter((t) => t !== null && nowMs - t < STALE_STOP_MS);
+
+          if (pendingEtas.length) {
+            const slip = nowMs - Math.min(...pendingEtas);
+            if (slip > 0) latenessMs = Math.min(slip, MAX_SLIP_MS);
+          }
         }
       } catch (e) {
         console.log("Load fetch error (non-fatal):", e.message);
@@ -235,6 +333,24 @@ exports.handler = async (event) => {
     } else {
       displayStatus = "30";
     }
+
+    // Resolve the ETA the customer is actually shown.
+    //
+    // Two things happen here. The raw value is re-emitted with an explicit zone
+    // so the browser cannot reinterpret a zone-less timestamp against the
+    // viewer's own clock, and the route slip measured above is added while the
+    // delivery is still pending. Once the driver has arrived or delivered, the
+    // timestamps are fact rather than forecast and are left untouched.
+    const rawEta = (exe.to && exe.to.etaDttm) || "";
+    const rawEtaMs = parseRouteTime(rawEta);
+    const pendingDelivery = displayStatus === "40" || displayStatus === "30";
+    const appliedMs = pendingDelivery ? latenessMs : 0;
+    const etaInfo = {
+      effective: rawEtaMs === null ? "" : new Date(rawEtaMs + appliedMs).toISOString(),
+      raw: rawEta,
+      latenessMin: Math.round(appliedMs / 60000),
+      adjusted: appliedMs > 0,
+    };
 
     // Build clean response — only fields the frontend needs.
     const result = {
@@ -298,6 +414,7 @@ exports.handler = async (event) => {
           })),
         },
       },
+      eta: etaInfo,
       stopsAway,
       stopsOnRoute,
     };
