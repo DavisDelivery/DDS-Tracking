@@ -142,8 +142,18 @@ exports.handler = async (event) => {
           const isTarget = (sStop) =>
             idsOf(sStop).some((id) => id === target || stripType(id) === targetBase);
 
-          // Walk the route in sequence order. Fall back to array order when the
-          // payload carries no usable sequence field.
+          // Put the route in the order the driver actually runs it.
+          //
+          // NuVizz returns stopSeq = 1 on EVERY stop of the load (it is a
+          // per-shipment leg number, not a route position), and the stops array
+          // itself comes back in no meaningful order. Sorting on stopSeq was
+          // therefore a no-op that left the arbitrary array order in place — so
+          // whichever stop happened to sit at index 0 counted zero stops ahead
+          // of it and was told "Next delivery".
+          //
+          // ETA is the only field that reflects real route order, so sequence on
+          // it. A genuine sequence field is still preferred, but only when it
+          // actually varies across the load.
           const seqOf = (s) => {
             const st = s.stop || {};
             const v = st.stopSeq != null ? st.stopSeq
@@ -154,8 +164,17 @@ exports.handler = async (event) => {
             const n = Number(v);
             return Number.isFinite(n) ? n : null;
           };
-          const ordered = stops.some((s) => seqOf(s) !== null)
-            ? [...stops].sort((a, b) => (seqOf(a) ?? 1e9) - (seqOf(b) ?? 1e9))
+          const etaOf = (s) => {
+            const t = Date.parse(((s.stopExecutionInfo || {}).to || {}).etaDttm || "");
+            return Number.isFinite(t) ? t : null;
+          };
+          const distinct = (fn) =>
+            new Set(stops.map(fn).filter((v) => v !== null)).size;
+
+          const rankBy = distinct(seqOf) > 1 ? seqOf : distinct(etaOf) > 1 ? etaOf : null;
+          // Stops with no rank sort last; equal ranks keep their original order.
+          const ordered = rankBy
+            ? [...stops].sort((a, b) => (rankBy(a) ?? Infinity) - (rankBy(b) ?? Infinity))
             : stops;
 
           // 90 = driver-confirmed delivered, 91 = manually completed by dispatch.
