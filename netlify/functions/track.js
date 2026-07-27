@@ -90,22 +90,37 @@ exports.handler = async (event) => {
   }
 
   // Davis serves multiple customers with different stop-number formats, all
-  // resolvable via the DAVIS company code. Build a list of candidates to try:
+  // resolvable via the DAVIS company code:
   //  - Uline style: all-digits, usually zero-padded to 9 (e.g. 007107386)
-  //  - Prefixed style: ARY/MCC/SHP + digits (e.g. ARY245516, SHP27000) -> use as-is
-  const trimmed = rawPro.trim().toUpperCase();
-  if (!trimmed) {
+  //  - Prefixed style: ARY/MCC/SHP + digits (e.g. ARY245516, SHP27000)
+  //  - Split shipments, which dispatch suffixes (e.g. 007150315-1)
+  // Spaces are dropped so a number read off a printed label still resolves.
+  const trimmed = rawPro.trim().toUpperCase().replace(/\s+/g, "");
+
+  // Restricting the charset here also keeps the value safe to interpolate into
+  // the upstream path below.
+  if (!/^[A-Z0-9]+(-[A-Z0-9]+)*$/.test(trimmed)) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  let candidates;
-  if (/^\d+$/.test(trimmed)) {
-    const padded = trimmed.padStart(9, "0");
-    candidates = padded === trimmed ? [trimmed] : [padded, trimmed];
-  } else if (/^[A-Z0-9]+$/.test(trimmed)) {
-    candidates = [trimmed];
+  const candidates = [];
+  const addCandidate = (v) => {
+    if (v && !candidates.includes(v)) candidates.push(v);
+  };
+
+  // A suffixed stop is its own shipment rather than an alias for the bare
+  // number — 007150315-1 and 007150315 are different deliveries — so the
+  // suffix is carried through every candidate and never stripped to widen a
+  // search. Zero-padding is tried first because customers routinely drop the
+  // leading zeros when typing.
+  const numeric = trimmed.match(/^(\d+)(-[A-Z0-9-]+)?$/);
+  if (numeric) {
+    const digits = numeric[1];
+    const suffix = numeric[2] || "";
+    addCandidate(digits.padStart(9, "0") + suffix);
+    addCandidate(trimmed);
   } else {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
+    addCandidate(trimmed);
   }
 
   const davisAuth = Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
@@ -115,7 +130,7 @@ exports.handler = async (event) => {
     let stopData = null;
     let stopNbr = null;
     for (const cand of candidates) {
-      const stopRes = await fetch(`${BASE}/stop/info/${cand}/DAVIS`, {
+      const stopRes = await fetch(`${BASE}/stop/info/${encodeURIComponent(cand)}/DAVIS`, {
         headers: { Authorization: `Basic ${davisAuth}` },
       });
       if (stopRes.ok) {
