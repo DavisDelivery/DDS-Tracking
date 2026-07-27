@@ -69,7 +69,13 @@ const API_BASE=window.location.origin;
 function fD(i){if(!i)return"—";try{return new Date(i).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric",timeZone:"America/New_York"})}catch{return i}}
 function fT(i){if(!i)return"";try{return new Date(i).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})}catch{return i}}
 function fDT(i){return i?fD(i)+" at "+fT(i):"—"}
-function fEW(i){if(!i)return"—";try{var M=15*60000,r=function(t){return new Date(Math.round(t/M)*M)},d=new Date(i),s=r(d.getTime()-30*60000),e=r(d.getTime()+90*60000);var f=function(t){return t.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})};return f(s)+" – "+f(e)}catch{return i}}
+// Backend sends eta.effective: zone-explicit and already shifted by any route
+// delay. Fall back to the raw NuVizz value so an older payload still renders.
+function eEta(d){return (d&&d.eta&&d.eta.effective)||(d&&d.exe&&d.exe.to&&d.exe.to.etaDttm)||""}
+function fEW(i){if(!i)return"—";try{var M=15*60000,r=function(t){return new Date(Math.round(t/M)*M)},d=new Date(i),s=r(d.getTime()-30*60000),e=r(d.getTime()+90*60000);
+// A window that has already elapsed is a promise we have visibly missed; say
+// something honest rather than quoting a time in the past.
+if(e.getTime()<Date.now())return"Arriving soon";var f=function(t){return t.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})};return f(s)+" – "+f(e)}catch{return i}}
 function fPh(p){if(!p)return"";var c=p.replace(/\D/g,"");return c.length===10?"("+c.slice(0,3)+") "+c.slice(3,6)+"-"+c.slice(6):p}
 function sL(c){return c==="90"?"Delivered":c==="45"?"Driver Arrived":c==="40"?"Out for Delivery":c==="50"?"Exception":"Scheduled"}
 function sC(c){return c==="90"?B.green:c==="45"?B.blue:c==="40"?B.accent:c==="50"?B.red:B.g400}
@@ -167,7 +173,7 @@ function renderResults(d){
   
   var etaHtml="";
   if(isLive){
-    etaHtml='<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap"><div style="background:'+B.blue+'0a;padding:10px 14px;border-radius:8px;border:1px solid '+B.blue+'18"><div style="font-size:9px;font-weight:700;color:'+B.blue+';text-transform:uppercase;letter-spacing:.5px">Estimated Arrival</div><div style="font-size:19px;font-weight:800;color:'+B.dark+';font-family:\'Plus Jakarta Sans\',sans-serif;line-height:1.2">'+fEW(exe.to.etaDttm)+'</div><div style="font-size:11px;color:'+B.g600+'">'+fD(exe.to.etaDttm)+'</div></div><div style="background:'+B.accent+'10;padding:10px 14px;border-radius:8px;border:1px solid '+B.accent+'25"><div style="font-size:9px;font-weight:700;color:'+B.orange+';text-transform:uppercase;letter-spacing:.5px">Driver Progress</div><div style="font-size:20px;font-weight:800;color:'+B.dark+';font-family:\'Plus Jakarta Sans\',sans-serif;line-height:1.2">'+(d.stopsAway===null||d.stopsAway===undefined?"On route":d.stopsAway>1?d.stopsAway+" stops away":d.stopsAway===1?"1 stop away":"Next delivery")+'</div></div></div>';
+    etaHtml='<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap"><div style="background:'+B.blue+'0a;padding:10px 14px;border-radius:8px;border:1px solid '+B.blue+'18"><div style="font-size:9px;font-weight:700;color:'+B.blue+';text-transform:uppercase;letter-spacing:.5px">Estimated Arrival</div><div style="font-size:19px;font-weight:800;color:'+B.dark+';font-family:\'Plus Jakarta Sans\',sans-serif;line-height:1.2">'+fEW(eEta(d))+'</div><div style="font-size:11px;color:'+B.g600+'">'+fD(eEta(d))+'</div></div><div style="background:'+B.accent+'10;padding:10px 14px;border-radius:8px;border:1px solid '+B.accent+'25"><div style="font-size:9px;font-weight:700;color:'+B.orange+';text-transform:uppercase;letter-spacing:.5px">Driver Progress</div><div style="font-size:20px;font-weight:800;color:'+B.dark+';font-family:\'Plus Jakarta Sans\',sans-serif;line-height:1.2">'+(d.stopsAway===null||d.stopsAway===undefined?"On route":d.stopsAway>1?d.stopsAway+" stops away":d.stopsAway===1?"1 stop away":"Next delivery")+'</div></div></div>';
   }
   if(isArr){
     etaHtml='<div style="margin-top:12px"><div style="background:'+B.blue+'0a;padding:12px 14px;border-radius:8px;border:1px solid '+B.blue+'18"><div style="font-size:10px;font-weight:700;color:'+B.blue+';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Driver On Site</div><div style="font-size:13px;color:'+B.g800+';font-weight:500;line-height:1.4">Your driver has arrived at your location'+(exe.to.arrivalDTTM?' at '+fT(exe.to.arrivalDTTM):'')+'.</div></div></div>';
