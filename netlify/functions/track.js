@@ -80,7 +80,7 @@ exports.handler = async (event) => {
     // so the load is the source of truth for "Out for Delivery".
     let loadStatus = "";
     let loadStarted = false;
-    let stopsAway = 0;
+    let stopsAway = null;
     let stopsOnRoute = 0;
     if (load && load.loadNbr) {
       try {
@@ -95,21 +95,93 @@ exports.handler = async (event) => {
           stopsOnRoute = lexe.stopsOnRoute || 0;
 
           const stops = (loadData.Load && loadData.Load.stops) || [];
+
+          // Key-gated diagnostic: return the raw shape of the load's stop list
+          // so we can see the actual identity/sequence/status field names.
+          const qp = event.queryStringParameters || {};
+          if (qp.debug === "1" && qp.key === (process.env.DASHBOARD_KEY || "davis2026")) {
+            return {
+              statusCode: 200,
+              headers,
+              body: JSON.stringify({
+                lookingFor: stopNbr,
+                loadNbr: load.loadNbr,
+                loadKeys: Object.keys((loadData && loadData.Load) || {}),
+                lexeKeys: Object.keys(lexe),
+                stopCount: stops.length,
+                sample: stops.slice(0, 20).map((s) => ({
+                  stopKeys: Object.keys(s.stop || {}),
+                  exeKeys: Object.keys(s.stopExecutionInfo || {}),
+                  stopNbr: (s.stop || {}).stopNbr,
+                  stopType: (s.stop || {}).stopType,
+                  stopSeq: (s.stop || {}).stopSeq,
+                  seqNbr: (s.stop || {}).seqNbr,
+                  sequence: (s.stop || {}).sequence,
+                  status: (s.stopExecutionInfo || {}).stopStatus,
+                  eta: ((s.stopExecutionInfo || {}).to || {}).etaDttm,
+                  confirmed: ((s.stopExecutionInfo || {}).to || {}).confirmedDTTM,
+                })),
+              }, null, 2),
+            };
+          }
+
+          // Match the target stop robustly. Dispatch labels stops with a type
+          // suffix (e.g. "007150559-DO") while the stop lookup returns the bare
+          // number, so a strict === comparison never matches and every stop
+          // silently reported "Next delivery". Compare on a normalized id and
+          // check every plausible identity field on the stop.
+          const normId = (v) =>
+            String(v == null ? "" : v).toUpperCase().replace(/[^A-Z0-9]/g, "");
+          const stripType = (v) => v.replace(/(DO|PU|DEL|PICK)$/, "");
+          const idsOf = (sStop) =>
+            [sStop.stopNbr, sStop.stopId, sStop.refNbr, sStop.orderNbr, sStop.stopRef]
+              .map(normId)
+              .filter(Boolean);
+          const target = normId(stopNbr);
+          const targetBase = stripType(target);
+          const isTarget = (sStop) =>
+            idsOf(sStop).some((id) => id === target || stripType(id) === targetBase);
+
+          // Walk the route in sequence order. Fall back to array order when the
+          // payload carries no usable sequence field.
+          const seqOf = (s) => {
+            const st = s.stop || {};
+            const v = st.stopSeq != null ? st.stopSeq
+              : st.seqNbr != null ? st.seqNbr
+              : st.sequence != null ? st.sequence
+              : st.stopSequence != null ? st.stopSequence
+              : null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          };
+          const ordered = stops.some((s) => seqOf(s) !== null)
+            ? [...stops].sort((a, b) => (seqOf(a) ?? 1e9) - (seqOf(b) ?? 1e9))
+            : stops;
+
+          // 90 = driver-confirmed delivered, 91 = manually completed by dispatch.
+          const isDone = (sExe) => {
+            const st = String(sExe.stopStatus || "");
+            if (st === "90" || st === "91") return true;
+            return !!((sExe.to || {}).confirmedDTTM) && !sExe.exceptionPresent;
+          };
+
           let foundTarget = false;
           let undeliveredBefore = 0;
-          for (const s of stops) {
+          for (const s of ordered) {
             const sStop = s.stop || {};
             const sExe = s.stopExecutionInfo || {};
-            if (sStop.stopNbr === stopNbr) {
+            if (isTarget(sStop)) {
               foundTarget = true;
               break;
             }
             // Only count delivery (DO) stops that are not yet delivered.
-            if (sStop.stopType === "DO" && sExe.stopStatus !== "90") {
+            if (sStop.stopType === "DO" && !isDone(sExe)) {
               undeliveredBefore++;
             }
           }
-          if (foundTarget) stopsAway = undeliveredBefore;
+          // Leave stopsAway null when the stop can't be located on the route —
+          // "unknown" must not be reported to the customer as "you're next".
+          stopsAway = foundTarget ? undeliveredBefore : null;
         }
       } catch (e) {
         console.log("Load fetch error (non-fatal):", e.message);
