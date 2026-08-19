@@ -41,6 +41,21 @@ exports.handler = async (event) => {
   const q = event.queryStringParameters || {};
   const ref = cleanRef(q.rid);
 
+  // IS THIS A PERSON, OR A MAIL SCANNER?
+  //
+  // This URL goes in a follow-up email, and corporate mail filters and link-preview bots
+  // fetch every link they see. Counting those as clicks would inflate the exact number this
+  // whole change exists to make honest — the dashboard would say "Went to Google" about
+  // someone who never opened the message.
+  //
+  // Fetch metadata is the cheap signal: a real top-level navigation from a tap sends
+  // Sec-Fetch-Mode: navigate and Sec-Fetch-Dest: document. Scanners generally send neither.
+  // It is a heuristic, not proof, so nothing is DISCARDED — a probe is recorded as a probe
+  // and kept out of the headline number, which is the honest way to hold a guess.
+  const h = event.headers || {};
+  const hv = (k) => String(h[k] || h[k.toLowerCase()] || "").toLowerCase();
+  const navigational = hv("sec-fetch-mode") === "navigate" || hv("sec-fetch-dest") === "document";
+
   // No ref, or a malformed one, is a legitimate call rather than an error — a bare /g means
   // "just take me to Google", which is what a page falls back to if it ever loses its ref.
   if (ref) {
@@ -51,7 +66,7 @@ exports.handler = async (event) => {
         // Carried through so the dashboard can say which button produced a click even when
         // the review row is slow to land, or never lands at all.
         source: normalizeSource(q.src),
-      }));
+      }, navigational));
     } catch (err) {
       // Logged, never surfaced. The customer is mid-hand-off.
       console.error("google click stamp failed (non-fatal):", err && err.message);

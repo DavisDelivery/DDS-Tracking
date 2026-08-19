@@ -39,11 +39,15 @@
 [functions."review-followup"]
   schedule = "@hourly"
 
+# These advertised the site as GET-only while netlify/functions/review.js answers
+# "POST, GET, DELETE, OPTIONS" for itself. Harmless today because every call is same-origin
+# and CORS never engages — but wrong as documentation, and a trap for whoever next moves a
+# page to another origin and cannot work out why the preflight fails.
 [[headers]]
   for = "/*"
   [headers.values]
     Access-Control-Allow-Origin = "*"
-    Access-Control-Allow-Methods = "GET, OPTIONS"
+    Access-Control-Allow-Methods = "GET, POST, DELETE, OPTIONS"
     Access-Control-Allow-Headers = "Content-Type"
 
 # Keep the internal admin dashboard out of search engines
@@ -53,8 +57,9 @@
     X-Robots-Tag = "noindex, nofollow"
 
 # Same for the click hop — it is a per-customer link that lands in inboxes, and a crawler
-# following it would stamp a click nobody made.
+# following it would stamp a click nobody made. Exact path, not "/g*": a glob would also
+# claim every future route beginning with the letter g.
 [[headers]]
-  for = "/g*"
+  for = "/g"
   [headers.values]
     X-Robots-Tag = "noindex, nofollow"

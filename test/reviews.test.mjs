@@ -16,6 +16,7 @@ const {
   GOOGLE_REVIEW_URL, GOOGLE_CLICK_PATH, trackedGoogleUrl,
   KNOWN_SOURCES, SOURCE_LABEL, normalizeSource,
   stampClick, clickedThrough, withClicks, cleanRef, validRef, isEmailAddress, followupEligible,
+  FOLLOWUP_CLAIM_TTL_MS,
   FOLLOWUP_DELAY_MS, FOLLOWUP_MAX_AGE_MS,
 } = require('../netlify/functions/lib/reviews.js');
 
@@ -257,4 +258,132 @@ test('a review submitted in the future is not chased', () => {
   // Clock skew between the submit host and the cron host would otherwise make age negative,
   // which is < FOLLOWUP_DELAY_MS and correctly refuses.
   assert.equal(followupEligible({ ...CHASEABLE, submittedAt: submitted(-HOUR) }, NOW), false);
+});
+
+// ── BOUNDED READS ────────────────────────────────────────────────────────────
+//
+// A scheduled function gets THIRTY SECONDS. The follow-up job reads one blob per review,
+// so the read loop is the part that will quietly start timing out as the store grows —
+// long after anyone is watching it.
+
+const { mapLimit, READ_CONCURRENCY } = require('../netlify/functions/lib/followup-core.js');
+
+test('mapLimit keeps results in input order despite running out of order', () => {
+  // Results are indexed into the output array, not pushed. Pushing would interleave them
+  // and silently pair each review with somebody else's click record.
+  const items = [50, 5, 30, 1, 20];
+  return mapLimit(items, 2, (n) => new Promise((r) => setTimeout(() => r(n), n)))
+    .then((out) => assert.deepEqual(out, items));
+});
+
+test('mapLimit never runs more than `limit` at once', async () => {
+  let live = 0, peak = 0;
+  await mapLimit([...Array(40).keys()], 4, async () => {
+    peak = Math.max(peak, ++live);
+    await new Promise((r) => setTimeout(r, 2));
+    live--;
+  });
+  assert.ok(peak <= 4, `peak concurrency was ${peak}`);
+  assert.ok(peak > 1, 'it should actually be concurrent, not accidentally serial');
+});
+
+test('mapLimit handles an empty list without hanging', async () => {
+  assert.deepEqual(await mapLimit([], READ_CONCURRENCY, async () => 'x'), []);
+});
+
+test('mapLimit does not spawn more workers than there are items', async () => {
+  let peak = 0, live = 0;
+  await mapLimit([1, 2], 12, async () => {
+    peak = Math.max(peak, ++live);
+    await new Promise((r) => setTimeout(r, 2));
+    live--;
+  });
+  assert.ok(peak <= 2, `peak was ${peak}`);
+});
+
+// ── SCANNER PROBES vs PEOPLE ─────────────────────────────────────────────────
+//
+// /g goes in an email, and corporate mail filters fetch every link they see. Counting those
+// as clicks would inflate the one number this whole change exists to make honest.
+
+test('a mail scanner fetch does not count as having gone to Google', () => {
+  const probe = stampClick(null, 'T1', {}, false);
+  assert.equal(probe.firstAt, undefined, 'a probe must never set firstAt');
+  assert.equal(probe.probeCount, 1);
+  assert.equal(clickedThrough({ clickRef: 'r' }, { r: probe }), false);
+});
+
+test('a real navigation after a probe still registers the customer', () => {
+  const probe = stampClick(null, 'T1', {}, false);
+  const human = stampClick(probe, 'T2', {}, true);
+  assert.equal(human.firstAt, 'T2', 'the human sets firstAt, not the earlier bot');
+  assert.equal(human.probeCount, 1, 'the probe is remembered, not erased');
+  assert.equal(clickedThrough({ clickRef: 'r' }, { r: human }), true);
+});
+
+test('a probe after a real click never rewrites the moment they went', () => {
+  const human = stampClick(null, 'T1', {}, true);
+  const later = stampClick(human, 'T9', {}, false);
+  assert.equal(later.firstAt, 'T1');
+  assert.equal(later.probeCount, 1);
+});
+
+test('withClicks surfaces probes so a quiet rate can be told from a busy one', () => {
+  const [row] = withClicks([{ id: 'r1', clickRef: 'abc12345' }], {
+    abc12345: { count: 3, probeCount: 2, lastAt: 'T3', source: 'review-followup' },
+  });
+  assert.equal(row.googleClickAt, null, 'no firstAt means nobody actually went');
+  assert.equal(row.googleClickProbes, 2);
+  assert.equal(row.googleClickSource, 'review-followup', 'the click knows which link produced it');
+});
+
+// ── THE CLAIM EXPIRES; THE SEND DOES NOT ─────────────────────────────────────
+//
+// The claim is written before the send so a crash cannot mail twice. A PERMANENT claim
+// turns any partial run -- a timeout, an unset sender, one Resend outage -- into a batch of
+// customers marked un-nudgeable forever, with nothing to show for it.
+
+test('a fresh claim blocks a second send', () => {
+  const claimed = { ...CHASEABLE, followupClaimedAt: new Date(NOW - 60 * 1000).toISOString() };
+  assert.equal(followupEligible(claimed, NOW), false);
+});
+
+test('a stale claim with no send becomes eligible again', () => {
+  const stale = { ...CHASEABLE, followupClaimedAt: new Date(NOW - FOLLOWUP_CLAIM_TTL_MS - 1000).toISOString() };
+  assert.equal(followupEligible(stale, NOW), true);
+});
+
+test('a stale claim that DID send stays blocked forever', () => {
+  // followupSentAt is checked first and has no expiry. This is the line between "we tried"
+  // and "they got one".
+  const sent = {
+    ...CHASEABLE,
+    followupClaimedAt: new Date(NOW - FOLLOWUP_CLAIM_TTL_MS - 1000).toISOString(),
+    followupSentAt: new Date(NOW - FOLLOWUP_CLAIM_TTL_MS - 1000).toISOString(),
+  };
+  assert.equal(followupEligible(sent, NOW), false);
+});
+
+test('an unparseable claim is left alone rather than retried', () => {
+  assert.equal(followupEligible({ ...CHASEABLE, followupClaimedAt: 'sometime' }, NOW), false);
+});
+
+// ── THE FOLLOW-UP LINK ───────────────────────────────────────────────────────
+
+test('src is a parameter, so the link cannot lose its question mark', () => {
+  // It used to be concatenated at the call site: trackedGoogleUrl(ref, origin) + "&src=...".
+  // With no ref that function emits no query string at all, so the concat produced
+  // ".../g&src=review-followup" -- no "?", matching no rule in netlify.toml, i.e. a 404 in
+  // a real customer's inbox. It was unreachable only because of a guard three files away.
+  const u = trackedGoogleUrl('', 'https://tracking.davisdelivery.com', 'review-followup');
+  assert.ok(u.includes('?'), `no query string: ${u}`);
+  assert.ok(!u.includes('/g&'), `malformed: ${u}`);
+  assert.equal(u, 'https://tracking.davisdelivery.com/g?src=review-followup');
+});
+
+test('a follow-up link is absolute — a relative one has no page to resolve against', () => {
+  const u = trackedGoogleUrl('abc12345', 'https://tracking.davisdelivery.com', 'review-followup');
+  assert.ok(u.startsWith('https://'), u);
+  assert.equal(new URL(u).searchParams.get('rid'), 'abc12345');
+  assert.equal(new URL(u).searchParams.get('src'), 'review-followup');
 });

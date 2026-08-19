@@ -12,8 +12,15 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 // NuVizz credentials — same env vars track.js uses. Reviews carry only a PRO,
 // so we resolve the delivering driver from NuVizz once (at submit time) and
-// store it on the review. Every reader (admin dashboard, MarginIQ Reviews tab,
-// Driver Scorecard Reviews tab) then gets per-driver attribution for free.
+// store it on the review, giving the dashboard per-driver attribution.
+//
+// This comment used to name a "MarginIQ Reviews tab" and a "Driver Scorecard
+// Reviews tab" as further readers. NEITHER EXISTS. Searched the dispatch app
+// for the blob store, this function's URL, DASHBOARD_KEY and the record's own
+// field names: nothing over there reads a review record at all. The only
+// consumers are public/admin.html and lib/followup-core.js, both in this repo.
+// Corrected rather than deleted because the false version was load-bearing —
+// it was cited as the reason not to rename routedTo.
 const DAVIS_USER = process.env.NUVIZZ_DAVIS_USER || "Chad";
 const DAVIS_PASS = process.env.NUVIZZ_DAVIS_PASS;
 const ULINE_USER = process.env.NUVIZZ_ULINE_USER || "Chad";
@@ -167,7 +174,22 @@ exports.handler = async (event) => {
         rv.driverId = driverId;
         rv.driverResolved = true;
         rv.driverAttempts = attempts + 1;
-        try { await store.setJSON(rv.id, rv); } catch (e) { /* non-fatal */ }
+        // RE-READ, THEN MERGE ONLY THE DRIVER FIELDS. Writing `rv` back wholesale writes a
+        // record that was read at the top of this handler, before a NuVizz round-trip —
+        // and in that window the follow-up mailer may have stamped followupClaimedAt or
+        // followupSentAt on the same key. A blind write erases them, and the customer gets
+        // a second "would you post a review?" on the next hourly run. This dashboard
+        // auto-logs-in from localStorage, so this path runs on every admin page load.
+        try {
+          const current = (await store.get(rv.id, { type: "json" })) || rv;
+          await store.setJSON(rv.id, {
+            ...current,
+            driver: rv.driver,
+            driverId: rv.driverId,
+            driverResolved: true,
+            driverAttempts: rv.driverAttempts,
+          });
+        } catch (e) { /* non-fatal: the retry counter simply does not advance */ }
         backfilled++;
       }
 
@@ -225,9 +247,18 @@ exports.handler = async (event) => {
     }
     try {
       const store = reviewsStore();
+      const clicks = clicksStore();
       const deleted = [];
       for (const id of ids) {
-        try { await store.delete(id); deleted.push(id); } catch (e) { /* skip */ }
+        try {
+          // Take the click record with it. Deleting only the review leaves an orphan in
+          // review-clicks that nothing will ever read or clean up, and these ids are used
+          // to purge test records, so the orphans would be pure accumulation.
+          const row = await store.get(id, { type: "json" });
+          if (row && row.clickRef) { try { await clicks.delete(row.clickRef); } catch (e) { /* skip */ } }
+          await store.delete(id);
+          deleted.push(id);
+        } catch (e) { /* skip */ }
       }
       return { statusCode: 200, headers, body: JSON.stringify({ deleted }) };
     } catch (err) {
@@ -332,9 +363,13 @@ exports.handler = async (event) => {
           `,
         }),
       });
-      const emailResult = await emailRes.json();
+      // Status FIRST, and the body only as text. The last outage this file records was a
+      // silent HTTP 403 from Resend (see the header) — and the one number that would have
+      // diagnosed it was the one never captured. Worse, .json() ran before the ok-check, so
+      // a non-JSON error body threw and the outer catch reported a Resend rejection as
+      // "Email send error: Unexpected token", i.e. as a network fault.
       if (!emailRes.ok) {
-        console.error("Resend API error:", emailResult);
+        console.error("Resend API error:", emailRes.status, await emailRes.text().catch(() => "<unreadable body>"));
       }
     } catch (err) {
       console.error("Email send error:", err);
@@ -380,7 +415,7 @@ exports.handler = async (event) => {
         }),
       });
       if (!posRes.ok) {
-        console.error("5-star email error:", await posRes.json());
+        console.error("5-star email error:", posRes.status, await posRes.text().catch(() => "<unreadable body>"));
       }
     } catch (err) {
       console.error("5-star email send error:", err);

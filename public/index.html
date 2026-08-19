@@ -14,7 +14,30 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="/review-kit.js"></script>
+<script src="/review-kit.js?v=2"></script>
+<script>
+/* If /review-kit.js fails to load — a 404, a blocked request, a stale CDN copy — this stub
+ * keeps the page working. Without it the failure is severe out of all proportion to its
+ * cause: index.html's render() clears #app BEFORE building, and the kit is first touched
+ * inside renderReviewCard, so a missing script leaves a BLANK WHITE PAGE for any delivered
+ * shipment. The customer came to track a delivery; losing the rating card is acceptable,
+ * losing the tracking is not.
+ *
+ * The stub degrades honestly rather than pretending: the Google link points straight at
+ * Google, so the hand-off still works and only the click measurement is lost. Measurement
+ * failing closed is the correct direction — an unrecorded click is a number we do not have,
+ * where a recorded-but-imaginary one is the bug this change exists to fix. */
+window.DDSReview=window.DDSReview||{
+  source:function(){return"direct"},
+  newRef:function(){return""},
+  googleHref:function(){return"https://g.page/r/CcBkxtEUiFOGEAE/review"},
+  postReview:function(p){try{return fetch("/.netlify/functions/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p),keepalive:true}).catch(function(){return null})}catch(e){return null}},
+  copyComment:function(){return null},
+  markSubmitted:function(){},
+  submittedRating:function(){return null},
+  FALLBACK:true
+};
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'DM Sans',system-ui,sans-serif;background:#f8f9fb;color:#1f2937;min-height:100vh}
@@ -195,9 +218,16 @@ function renderResults(d){
   // ORDER. Normally: advert, then the rating card. But when the customer followed the
   // "Rate this delivery" button (rate=1), the rating is the errand they came to run and the
   // advert is in its way — so the card goes first and lands in the opening viewport.
-  if(isDel&&RATE_INTENT)frag.appendChild(renderReviewCard(s.stopNbr));
+  // Wrapped: the rating card is the newest and most-changed thing on this page, and
+  // render() has already cleared #app by the time it runs, so anything it throws costs the
+  // customer their whole tracking view. A delivery they cannot see is a support call; a
+  // rating card they cannot see is nothing.
+  function reviewCardOrNothing(){
+    try{return renderReviewCard(s.stopNbr)}catch(e){console.error("review card failed:",e);return document.createDocumentFragment()}
+  }
+  if(isDel&&RATE_INTENT)frag.appendChild(reviewCardOrNothing());
   frag.appendChild(cta);
-  if(isDel&&!RATE_INTENT)frag.appendChild(renderReviewCard(s.stopNbr));
+  if(isDel&&!RATE_INTENT)frag.appendChild(reviewCardOrNothing());
 
   // Status/PRO# card THIRD
   frag.appendChild(statusCard);

@@ -63,12 +63,19 @@ function clicksStore() {
 // an inbox has no page to be relative to.
 const GOOGLE_CLICK_PATH = "/g";
 
-function trackedGoogleUrl(reviewId, origin) {
+// src is a PARAMETER, not something callers append. It used to be concatenated on at the
+// call site as "...&src=review-followup", which is correct only while the ref is non-empty:
+// with no ref this function emits no query string at all, so the concat produced
+// "/g&src=review-followup" — no "?", matching no rule in netlify.toml, i.e. a 404 in a real
+// customer's inbox. That was unreachable only because of a guard three files away.
+function trackedGoogleUrl(reviewId, origin, src) {
   const base = origin ? String(origin).replace(/\/+$/, "") : "";
+  const qs = new URLSearchParams();
   const id = String(reviewId == null ? "" : reviewId).trim();
-  return id
-    ? `${base}${GOOGLE_CLICK_PATH}?rid=${encodeURIComponent(id)}`
-    : `${base}${GOOGLE_CLICK_PATH}`;
+  if (id) qs.set("rid", id);
+  if (src) qs.set("src", String(src));
+  const q = qs.toString();
+  return q ? `${base}${GOOGLE_CLICK_PATH}?${q}` : `${base}${GOOGLE_CLICK_PATH}`;
 }
 
 // ── THE CLICK REF ────────────────────────────────────────────────────────────
@@ -127,19 +134,34 @@ function normalizeSource(raw) {
 // to us — so the honest ceiling is "they took the link". Everything downstream must be
 // careful to say that and not more.
 //
-// firstAt is kept separate from lastAt so a customer who clicks twice does not look like
-// two customers, and count is kept so an obviously-bot double-fire is visible rather than
-// silently averaged away.
-function stampClick(prevClick, nowIso, extra) {
+// firstAt is kept separate from lastAt so a customer who clicks twice does not look like two
+// customers.
+//
+// count is read-modify-write with no compare-and-set, so two clicks landing in the same
+// instant can both read 0 and both write 1. It is therefore a LOWER BOUND on clicks, not a
+// tally — worth having, not worth trusting to the unit. firstAt, the field everything else
+// keys on, is unaffected: either writer sets it to the same truth.
+function stampClick(prevClick, nowIso, extra, navigational = true) {
   const prev = prevClick && typeof prevClick === "object" ? prevClick : {};
-  const count = Number(prev.count || 0);
-  return {
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const next = {
     ...prev,
     ...(extra || {}),
-    firstAt: prev.firstAt || nowIso,
     lastAt: nowIso,
-    count: (Number.isFinite(count) ? count : 0) + 1,
+    count: n(prev.count) + 1,
   };
+  if (navigational) {
+    // Only a request that looks like a real browser navigation may set firstAt, because
+    // firstAt is what every reader treats as "this customer went to Google".
+    next.firstAt = prev.firstAt || nowIso;
+  } else {
+    // A probe is remembered, and kept out of the headline number. Deliberately not
+    // discarded: a ref that only ever gets probed is worth being able to see.
+    next.probeCount = n(prev.probeCount) + 1;
+    next.lastProbeAt = nowIso;
+    if (prev.firstAt) next.firstAt = prev.firstAt;
+  }
+  return next;
 }
 
 // Did this review ever reach the Google page? The only true predicate available, and it is
@@ -162,6 +184,16 @@ function withClicks(reviews, clicksByRef) {
       googleClickAt: (hit && hit.firstAt) || null,
       googleClickLastAt: (hit && hit.lastAt) || null,
       googleClickCount: (hit && hit.count) || 0,
+      // Fetches that did not look like a browser navigation — mail scanners and link
+      // preview bots. Surfaced rather than hidden so a suspiciously quiet click-through
+      // rate can be told apart from a suspiciously busy one.
+      googleClickProbes: (hit && hit.probeCount) || 0,
+      // Which link produced the CLICK, which is not always the source that produced the
+      // REVIEW: a follow-up email sends them to /g directly, so the review says
+      // "review-email" while the click says "review-followup". Surfaced because g.js writes
+      // it and, until now, nothing read it — a field stored for a stated purpose it did not
+      // actually serve.
+      googleClickSource: (hit && hit.source) || null,
     };
   });
 }
@@ -173,6 +205,9 @@ function withClicks(reviews, clicksByRef) {
 // below is a reason NOT to send.
 const FOLLOWUP_DELAY_MS = 2 * 60 * 60 * 1000;   // let them finish on their own first
 const FOLLOWUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // never chase a stale one
+// How long a claim holds before the record is considered retryable. Long enough that a slow
+// send can never be double-mailed; short enough that one bad run does not cost a day.
+const FOLLOWUP_CLAIM_TTL_MS = 6 * 60 * 60 * 1000;
 
 // Same shape the dispatch app uses. Not a full RFC validator — the point is to refuse the
 // phone numbers customers type into the same "Phone or email" box, not to police TLDs.
@@ -194,7 +229,17 @@ function followupEligible(review, nowMs) {
   if (!review.clickRef) return false;
   if (review.googleClickAt) return false;               // they already went (joined by withClicks)
   if (review.followupSentAt) return false;              // once, ever
-  if (review.followupClaimedAt) return false;           // a send is already in flight
+  // A CLAIM EXPIRES; a send does not. The claim is written before the send so a crash
+  // mid-flight cannot mail twice — but a permanent claim means any run that dies partway
+  // (a timeout, a bad sender address, one Resend outage) silently marks its whole batch
+  // un-nudgeable forever, with nothing to show for it but a console line. That is the same
+  // failure as the bug being fixed, just with a different victim. After the window, a
+  // claimed-but-unsent record becomes eligible again.
+  if (review.followupClaimedAt) {
+    const claimed = Date.parse(review.followupClaimedAt);
+    if (!Number.isFinite(claimed)) return false;        // unparseable: leave it alone
+    if (nowMs - claimed < FOLLOWUP_CLAIM_TTL_MS) return false;
+  }
   if (!isEmailAddress(review.contact)) return false;    // nowhere to send it
   const t = Date.parse(review.submittedAt || "");
   if (!Number.isFinite(t)) return false;                // undatable — leave it alone
@@ -223,4 +268,5 @@ module.exports = {
   followupEligible,
   FOLLOWUP_DELAY_MS,
   FOLLOWUP_MAX_AGE_MS,
+  FOLLOWUP_CLAIM_TTL_MS,
 };

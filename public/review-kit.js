@@ -29,12 +29,22 @@
  *
  * For a 4-5 star rating the submit control IS the Google link: a real anchor, in the same
  * tab, with no JavaScript anywhere in the navigation path. The browser navigates natively,
- * so there is no popup to block and no activation to lose — and, critically, iOS treats a
- * genuine anchor tap as user-initiated, which is the ONLY thing that triggers the Universal
- * Link hand-off into the Google Maps app. That matters more than it sounds: inside an iOS
- * email webview the cookie jar is isolated from Safari, so a customer who merely LANDS on
- * google.com is signed out and hits a sign-in wall. Reaching the app is the difference
- * between "could post" and "could not".
+ * so there is no popup to block, no activation to lose, and it still works in the webviews
+ * where window.open and target="_blank" are simply dead.
+ *
+ * A CORRECTION, because an earlier draft of this comment claimed otherwise and that is the
+ * exact failure mode this file exists to fix. It said the anchor was needed to trigger the
+ * iOS Universal Link hand-off into the Google Maps app. THERE IS NO iOS UNIVERSAL LINK ON
+ * THIS CHAIN. Checked directly: g.page/.well-known/apple-app-site-association returns 404,
+ * and search.google.com's (the final hop) 301-redirects — Apple discards an AASA served via
+ * a redirect. Android App Links DO exist, delegated to com.google.android.apps.maps from
+ * search.google.com's assetlinks.json. So on Android the app hand-off is real; on iOS it
+ * never was, and the anchor's justification rests on the three plain reasons above.
+ *
+ * WHAT THAT MEANS FOR THE CUSTOMER, and it is the real drop-off: inside an iOS email
+ * webview the cookie jar is isolated from Safari, so a customer who lands on Google is
+ * signed out and meets accounts.google.com instead of a review box. Nothing in our power
+ * fixes that. All we can do is warn them before they go, which the button copy now does.
  *
  * The review POST rides alongside it, fire-and-forget with keepalive so it survives the
  * navigation. That makes the POST best-effort, which is a real cost and the right trade:
