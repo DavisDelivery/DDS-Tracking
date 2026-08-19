@@ -88,6 +88,8 @@ function el(tag,attrs,children){
 
 var app=document.getElementById("app");
 var proValue="";
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 var currentData=null;
 
 function render(){
@@ -140,7 +142,10 @@ function renderBody(){
   }
   if(currentData&&currentData.error){
     var err=el("div",{style:{background:"#fef5f5",border:"1px solid #f0c8c8",borderRadius:"12px",padding:"20px 24px",marginTop:"4px"}});
-    err.innerHTML='<div style="font-weight:700;color:'+B.red+';font-size:15px;margin-bottom:4px">Shipment Not Found</div><div style="color:#6a3030;font-size:13px">No shipment found for PRO# '+currentData.error+'. Please verify your tracking number.</div><div style="margin-top:10px;font-size:13px">Need help? <a href="tel:6789263939" style="color:'+B.blue+';font-weight:700;text-decoration:none">(678) 926-3939</a></div>';
+    var note=currentData.carrier
+      ? '<div style="color:#6a3030;font-size:13px;margin-top:8px">That looks like a <b>'+esc(currentData.carrier)+'</b> PRO number. Davis handles the final-mile delivery, but our system files these shipments under a different number — check your delivery confirmation for the Davis PRO#, or call us and we\'ll look it up for you.</div>'
+      : '';
+    err.innerHTML='<div style="font-weight:700;color:'+B.red+';font-size:15px;margin-bottom:4px">Shipment Not Found</div><div style="color:#6a3030;font-size:13px">No shipment found for PRO# '+esc(currentData.error)+'. Please verify your tracking number.</div>'+note+'<div style="margin-top:10px;font-size:13px">Need help? <a href="tel:6789263939" style="color:'+B.blue+';font-weight:700;text-decoration:none">(678) 926-3939</a></div>';
     body.appendChild(err);
     return body;
   }
@@ -485,7 +490,7 @@ async function doSearch(){
   try{
     var res=await fetch(API_BASE+"/.netlify/functions/track?pro="+encodeURIComponent(proValue.trim()));
     var data=await res.json();
-    if(data.error){currentData={error:proValue.trim()}}
+    if(data.error){currentData={error:proValue.trim(),carrier:data.carrier||"",searched:data.searched||[]}}
     else{currentData=data}
   }catch(e){
     currentData={error:proValue.trim()};
