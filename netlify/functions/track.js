@@ -235,6 +235,40 @@ exports.handler = async (event) => {
 
   const { carrier } = detectLabel(norm);
 
+  const qsp = event.queryStringParameters || {};
+  const debugOk = qsp.debug === "1" && qsp.key === (process.env.DASHBOARD_KEY || "davis2026");
+
+  // Key-gated: probe company codes we hold no dedicated credentials for.
+  // NuVizz tenants commonly file each customer or agent under its own company
+  // code, so "which company is this stop filed under" is a question worth
+  // being able to ask without a redeploy. Reports the raw HTTP status per
+  // candidate so a 401 (code exists, wrong credentials) is distinguishable
+  // from a 404 (no such stop).
+  if (debugOk && qsp.co) {
+    const codes = String(qsp.co).toUpperCase().split(",").map((c) => c.trim()).filter(Boolean).slice(0, 8);
+    const creds = COMPANIES.filter((c) => c.pass);
+    const probes = [];
+    for (const code of codes) {
+      for (const cred of creds) {
+        for (const cand of candidates) {
+          probes.push({ code, as: cred.code, cand });
+        }
+      }
+    }
+    const out = await Promise.all(probes.slice(0, 60).map(async (pr) => {
+      const cred = COMPANIES.find((c) => c.code === pr.as);
+      try {
+        const r = await fetch(`${BASE}/stop/info/${encodeURIComponent(pr.cand)}/${pr.code}`, {
+          headers: { Authorization: authHeaderFor(cred) },
+        });
+        return `${pr.cand}@${pr.code} as ${pr.as} -> ${r.status}`;
+      } catch (e) {
+        return `${pr.cand}@${pr.code} as ${pr.as} -> ERR ${e.message}`;
+      }
+    }));
+    return { statusCode: 200, headers, body: JSON.stringify({ probe: out }, null, 2) };
+  }
+
   try {
     const resolved = await resolveStop(candidates);
     const stopData = resolved.data;
