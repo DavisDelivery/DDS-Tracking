@@ -54,23 +54,153 @@ const LOAD_CACHE_TTL_MS = 60 * 1000;
 const LOAD_CACHE_MAX = 200;
 const loadCache = new Map();
 
-function getCachedLoad(loadNbr) {
-  const hit = loadCache.get(loadNbr);
+// Keyed by company + load number: the lookup now spans more than one company
+// code, and a load number is only unique within its own company.
+function getCachedLoad(key) {
+  const hit = loadCache.get(key);
   if (!hit) return null;
   if (Date.now() - hit.at > LOAD_CACHE_TTL_MS) {
-    loadCache.delete(loadNbr);
+    loadCache.delete(key);
     return null;
   }
   return hit.data;
 }
 
-function setCachedLoad(loadNbr, data) {
+function setCachedLoad(key, data) {
   // Bounded; Map preserves insertion order so the oldest key evicts first.
   if (loadCache.size >= LOAD_CACHE_MAX) {
     const oldest = loadCache.keys().next().value;
     if (oldest !== undefined) loadCache.delete(oldest);
   }
-  loadCache.set(loadNbr, { at: Date.now(), data });
+  loadCache.set(key, { at: Date.now(), data });
+}
+
+// Company codes a stop can live under. Davis dispatches most work under the
+// DAVIS company, but Uline-originated stops are filed under ULINE — and until
+// now the lookup only ever asked DAVIS, so anything filed elsewhere was
+// unfindable no matter how the customer typed it.
+const COMPANIES = [
+  { code: "DAVIS", user: DAVIS_USER, pass: DAVIS_PASS },
+  { code: "ULINE", user: ULINE_USER, pass: ULINE_PASS },
+];
+
+function authHeaderFor(company) {
+  if (!company.pass) return null;
+  return "Basic " + Buffer.from(`${company.user}:${company.pass}`).toString("base64");
+}
+
+// Labels customers type in front of the number. Davis runs the final mile for
+// several LTL carriers, so the paperwork in the customer's hand often carries
+// the linehaul carrier's name and PRO rather than the Davis stop number.
+//
+// A label is only ever used to derive an EXTRA candidate. ARY/MCC/SHP/AVRT are
+// also genuine Davis stop-number prefixes, so the string exactly as typed is
+// always tried first and never rewritten out from under us.
+const CARRIER_LABELS = [
+  { name: "Estes Express", re: /^(?:ESTESEXPRESSLINES|ESTESEXPRESS|ESTES|EXLA)/ },
+  { name: "Averitt Express", re: /^(?:AVERITTEXPRESS|AVERITT|AVRT)/ },
+];
+const GENERIC_LABEL = /^(?:PRONUMBER|PRONBR|PRO|TRACKINGNUMBER|TRACKING|BOLNUMBER|BOL)/;
+
+// Strip punctuation and casing. Customers paste "estes-0831846593",
+// "PRO # 007107386", "SHP-27000" — every one of which used to be rejected as
+// an invalid PRO before any lookup ran at all.
+function normalizePro(raw) {
+  return String(raw == null ? "" : raw).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Split a recognised label off the front of a normalized value. Returns the
+// carrier name (for the not-found message) and the bare number underneath.
+function detectLabel(norm) {
+  for (const c of CARRIER_LABELS) {
+    const m = norm.match(c.re);
+    if (m && m[0].length < norm.length && /^\d/.test(norm.slice(m[0].length))) {
+      return { carrier: c.name, rest: norm.slice(m[0].length) };
+    }
+  }
+  const g = norm.match(GENERIC_LABEL);
+  if (g && g[0].length < norm.length && /^\d/.test(norm.slice(g[0].length))) {
+    return { carrier: "", rest: norm.slice(g[0].length) };
+  }
+  return { carrier: "", rest: "" };
+}
+
+const MAX_CANDIDATES = 6;
+
+// Every shape the same shipment might be filed under, most-likely first.
+function buildCandidates(norm) {
+  const out = [];
+  const add = (v) => {
+    if (!v || out.length >= MAX_CANDIDATES) return;
+    if (!/^[A-Z0-9]{3,40}$/.test(v)) return;
+    if (!out.includes(v)) out.push(v);
+  };
+  // Uline-style stop numbers are zero-padded to nine digits and customers drop
+  // the padding; carrier PROs carry a leading zero that Davis stop numbers do
+  // not. Try a bare number every way it is written.
+  const addNumberShapes = (v) => {
+    if (!/^\d+$/.test(v)) { add(v); return; }
+    if (v.length < 9) add(v.padStart(9, "0"));
+    add(v);
+    const bare = v.replace(/^0+/, "");
+    if (bare && bare !== v) {
+      if (bare.length < 9) add(bare.padStart(9, "0"));
+      add(bare);
+    }
+  };
+
+  addNumberShapes(norm);
+
+  const { rest } = detectLabel(norm);
+  if (rest) addNumberShapes(rest);
+
+  return out;
+}
+
+async function fetchStop(cand, companyCode, auth) {
+  const res = await fetch(`${BASE}/stop/info/${encodeURIComponent(cand)}/${companyCode}`, {
+    headers: { Authorization: auth },
+  });
+  if (!res.ok) return null;
+  const json = await res.json().catch(() => null);
+  return json && json.Stop && json.Stop.stop ? json : null;
+}
+
+// Resolve a stop across every candidate shape and every company code.
+//
+// The happy path is unchanged in cost: a well-formed stop number is one
+// request against DAVIS, exactly as before. The wider fan-out only runs for
+// lookups that previously ended in a flat "Shipment Not Found", so nothing
+// that works today gets slower.
+async function resolveStop(candidates) {
+  const companies = COMPANIES
+    .map((c) => ({ code: c.code, auth: authHeaderFor(c) }))
+    .filter((c) => c.auth);
+  const tried = [];
+  const miss = { data: null, company: "", matched: "", tried };
+
+  if (!candidates.length) return miss;
+
+  for (const company of companies) {
+    const head = candidates[0];
+    tried.push(`${head}@${company.code}`);
+    const first = await fetchStop(head, company.code, company.auth).catch(() => null);
+    if (first) return { data: first, company: company.code, matched: head, tried };
+
+    const rest = candidates.slice(1);
+    if (!rest.length) continue;
+    for (const c of rest) tried.push(`${c}@${company.code}`);
+    const results = await Promise.all(
+      rest.map((c) => fetchStop(c, company.code, company.auth).catch(() => null))
+    );
+    // findIndex keeps candidate priority even though the calls ran together.
+    const hit = results.findIndex(Boolean);
+    if (hit !== -1) {
+      return { data: results[hit], company: company.code, matched: rest[hit], tried };
+    }
+  }
+
+  return miss;
 }
 
 exports.handler = async (event) => {
@@ -89,48 +219,47 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing pro parameter" }) };
   }
 
-  // Davis serves multiple customers with different stop-number formats, all
-  // resolvable via the DAVIS company code. Build a list of candidates to try:
-  //  - Uline style: all-digits, usually zero-padded to 9 (e.g. 007107386)
-  //  - Prefixed style: ARY/MCC/SHP + digits (e.g. ARY245516, SHP27000) -> use as-is
-  const trimmed = rawPro.trim().toUpperCase();
-  if (!trimmed) {
+  // Davis serves several customers and several linehaul carriers, each with a
+  // different number format, and the number reaches us in whatever shape the
+  // customer's paperwork printed it. Normalize first, then try every plausible
+  // shape of it against every company code we hold credentials for.
+  const norm = normalizePro(rawPro);
+  if (!norm) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  let candidates;
-  if (/^\d+$/.test(trimmed)) {
-    const padded = trimmed.padStart(9, "0");
-    candidates = padded === trimmed ? [trimmed] : [padded, trimmed];
-  } else if (/^[A-Z0-9]+$/.test(trimmed)) {
-    candidates = [trimmed];
-  } else {
+  const candidates = buildCandidates(norm);
+  if (!candidates.length) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  const davisAuth = Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
+  const { carrier } = detectLabel(norm);
 
   try {
-    // Call 1: resolve the stop. Try each candidate against /stop/info/{stopNbr}/DAVIS
-    let stopData = null;
-    let stopNbr = null;
-    for (const cand of candidates) {
-      const stopRes = await fetch(`${BASE}/stop/info/${cand}/DAVIS`, {
-        headers: { Authorization: `Basic ${davisAuth}` },
-      });
-      if (stopRes.ok) {
-        const json = await stopRes.json();
-        if (json && json.Stop && json.Stop.stop) {
-          stopData = json;
-          stopNbr = json.Stop.stop.stopNbr || cand;
-          break;
-        }
-      }
-    }
+    const resolved = await resolveStop(candidates);
+    const stopData = resolved.data;
+    const companyCode = resolved.company || "DAVIS";
+    const auth = authHeaderFor(
+      COMPANIES.find((c) => c.code === companyCode) || COMPANIES[0]
+    );
 
     if (!stopData) {
-      return { statusCode: 404, headers, body: JSON.stringify({ error: "No data for this PRO" }) };
+      // Say which shapes were actually looked up, and name the carrier when the
+      // number was labelled with one. A customer holding a linehaul carrier's
+      // PRO needs to know that number is not what identifies the stop here,
+      // not just that we came up empty.
+      return {
+        statusCode: 404,
+        headers,
+        body: JSON.stringify({
+          error: "No data for this PRO",
+          searched: candidates,
+          carrier: carrier || "",
+        }),
+      };
     }
+
+    const stopNbr = stopData.Stop.stop.stopNbr || resolved.matched;
 
     const stop = stopData.Stop.stop;
     const load = stopData.Stop.load || {};
@@ -152,14 +281,15 @@ exports.handler = async (event) => {
     let latenessMs = 0;
     if (load && load.loadNbr) {
       try {
-        let loadData = getCachedLoad(load.loadNbr);
+        const loadKey = `${companyCode}:${load.loadNbr}`;
+        let loadData = getCachedLoad(loadKey);
         if (!loadData) {
-          const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/DAVIS`, {
-            headers: { Authorization: `Basic ${davisAuth}` },
+          const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/${companyCode}`, {
+            headers: { Authorization: auth },
           });
           if (loadRes.ok) {
             loadData = await loadRes.json();
-            setCachedLoad(load.loadNbr, loadData);
+            setCachedLoad(loadKey, loadData);
           }
         }
         if (loadData) {
@@ -179,6 +309,9 @@ exports.handler = async (event) => {
               headers,
               body: JSON.stringify({
                 lookingFor: stopNbr,
+                input: { raw: rawPro, normalized: norm, candidates, carrier },
+                resolvedBy: { candidate: resolved.matched, company: companyCode },
+                tried: resolved.tried,
                 loadNbr: load.loadNbr,
                 loadKeys: Object.keys((loadData && loadData.Load) || {}),
                 lexeKeys: Object.keys(lexe),
@@ -417,6 +550,8 @@ exports.handler = async (event) => {
       eta: etaInfo,
       stopsAway,
       stopsOnRoute,
+      company: companyCode,
+      matchedPro: resolved.matched,
     };
 
     return { statusCode: 200, headers, body: JSON.stringify(result) };
