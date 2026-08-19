@@ -1,9 +1,5 @@
 const fetch = require("node-fetch");
 
-const DAVIS_USER = process.env.NUVIZZ_DAVIS_USER || "Chad";
-const DAVIS_PASS = process.env.NUVIZZ_DAVIS_PASS;
-const ULINE_USER = process.env.NUVIZZ_ULINE_USER || "Chad";
-const ULINE_PASS = process.env.NUVIZZ_ULINE_PASS;
 const BASE = "https://portal.nuvizz.com/deliverit/openapi/v7";
 
 // Davis runs Eastern time. NuVizz returns wall-clock timestamps with no zone
@@ -75,69 +71,90 @@ function setCachedLoad(key, data) {
   loadCache.set(key, { at: Date.now(), data });
 }
 
-// Company codes a stop can live under. Davis dispatches most work under the
-// DAVIS company, but Uline-originated stops are filed under ULINE — and until
-// now the lookup only ever asked DAVIS, so anything filed elsewhere was
-// unfindable no matter how the customer typed it.
-const COMPANIES = [
-  { code: "DAVIS", user: DAVIS_USER, pass: DAVIS_PASS },
-  { code: "ULINE", user: ULINE_USER, pass: ULINE_PASS },
-];
+// Company codes a stop can live under, searched in order. Davis dispatches
+// most work under DAVIS and Uline-originated stops are filed under ULINE; the
+// lookup used to ask DAVIS only, so anything filed elsewhere was unfindable no
+// matter how the customer typed it.
+//
+// Credentials are per company code and authorize only that code — DAVIS
+// credentials against the ULINE company return 401, and vice versa. So
+// reaching an agent or carrier filed under its own company code needs its own
+// credentials, and NUVIZZ_COMPANIES adds one without a code change: list the
+// code here and supply NUVIZZ_<CODE>_USER / NUVIZZ_<CODE>_PASS, the same
+// naming the existing two already use.
+const COMPANIES = (process.env.NUVIZZ_COMPANIES || "DAVIS,ULINE")
+  .toUpperCase()
+  .split(",")
+  .map((c) => c.trim())
+  .filter(Boolean)
+  .map((code) => ({
+    code,
+    user: process.env[`NUVIZZ_${code}_USER`] || "Chad",
+    pass: process.env[`NUVIZZ_${code}_PASS`],
+  }));
 
 function authHeaderFor(company) {
   if (!company.pass) return null;
   return "Basic " + Buffer.from(`${company.user}:${company.pass}`).toString("base64");
 }
 
-// Labels customers type in front of the number. Davis runs the final mile for
-// several LTL carriers, so the paperwork in the customer's hand often carries
-// the linehaul carrier's name and PRO rather than the Davis stop number.
-//
-// A label is only ever used to derive an EXTRA candidate. ARY/MCC/SHP/AVRT are
-// also genuine Davis stop-number prefixes, so the string exactly as typed is
-// always tried first and never rewritten out from under us.
+// Carriers whose freight Davis runs the final mile for. The dispatch board
+// writes these orders into NuVizz with the carrier in the stop number itself —
+// "<CARRIER>-<PRO digits>", e.g. ESTES-0831846593 — so the hyphen is part of
+// the identifier, not punctuation to be cleaned off. `codes` are the prefixes
+// the board actually writes; `re` matches what a customer types.
 const CARRIER_LABELS = [
-  { name: "Estes Express", re: /^(?:ESTESEXPRESSLINES|ESTESEXPRESS|ESTES|EXLA)/ },
-  { name: "Averitt Express", re: /^(?:AVERITTEXPRESS|AVERITT|AVRT)/ },
+  { name: "Estes Express", re: /^(?:ESTESEXPRESSLINES|ESTESEXPRESS|ESTES|EXLA)/, codes: ["ESTES"] },
+  { name: "Averitt Express", re: /^(?:AVERITTEXPRESS|AVERITT|AVRT)/, codes: ["AVRT", "AVERITT"] },
 ];
 const GENERIC_LABEL = /^(?:PRONUMBER|PRONBR|PRO|TRACKINGNUMBER|TRACKING|BOLNUMBER|BOL)/;
 
-// Strip punctuation and casing. Customers paste "estes-0831846593",
-// "PRO # 007107386", "SHP-27000" — every one of which used to be rejected as
-// an invalid PRO before any lookup ran at all.
+// Two normalizations, because two stop-number shapes are in play. Uline stops
+// are bare zero-padded digits; carrier stops carry a hyphenated prefix. Keeping
+// the hyphen is what makes "estes-0831846593" resolve — stripping it was why it
+// could not.
+function hyphenForm(raw) {
+  return String(raw == null ? "" : raw)
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 function normalizePro(raw) {
   return String(raw == null ? "" : raw).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-// Split a recognised label off the front of a normalized value. Returns the
-// carrier name (for the not-found message) and the bare number underneath.
-function detectLabel(norm) {
+// Split a recognised label off the front of an alphanumeric value. Returns the
+// carrier name (for the not-found message), the bare number underneath, and the
+// stop-number prefixes that carrier is filed under.
+function detectLabel(alnum) {
   for (const c of CARRIER_LABELS) {
-    const m = norm.match(c.re);
-    if (m && m[0].length < norm.length && /^\d/.test(norm.slice(m[0].length))) {
-      return { carrier: c.name, rest: norm.slice(m[0].length) };
+    const m = alnum.match(c.re);
+    if (m && m[0].length < alnum.length && /^\d/.test(alnum.slice(m[0].length))) {
+      return { carrier: c.name, rest: alnum.slice(m[0].length), codes: c.codes };
     }
   }
-  const g = norm.match(GENERIC_LABEL);
-  if (g && g[0].length < norm.length && /^\d/.test(norm.slice(g[0].length))) {
-    return { carrier: "", rest: norm.slice(g[0].length) };
+  const g = alnum.match(GENERIC_LABEL);
+  if (g && g[0].length < alnum.length && /^\d/.test(alnum.slice(g[0].length))) {
+    return { carrier: "", rest: alnum.slice(g[0].length), codes: [] };
   }
-  return { carrier: "", rest: "" };
+  return { carrier: "", rest: "", codes: [] };
 }
 
-const MAX_CANDIDATES = 6;
+const MAX_CANDIDATES = 8;
+const VALID_STOP_NBR = /^[A-Z0-9][A-Z0-9-]{1,38}[A-Z0-9]$/;
 
 // Every shape the same shipment might be filed under, most-likely first.
-function buildCandidates(norm) {
+function buildCandidates(raw) {
   const out = [];
   const add = (v) => {
     if (!v || out.length >= MAX_CANDIDATES) return;
-    if (!/^[A-Z0-9]{3,40}$/.test(v)) return;
+    if (!VALID_STOP_NBR.test(v)) return;
     if (!out.includes(v)) out.push(v);
   };
   // Uline-style stop numbers are zero-padded to nine digits and customers drop
-  // the padding; carrier PROs carry a leading zero that Davis stop numbers do
-  // not. Try a bare number every way it is written.
+  // the padding; carrier PROs carry a leading zero that Uline numbers do not.
   const addNumberShapes = (v) => {
     if (!/^\d+$/.test(v)) { add(v); return; }
     if (v.length < 9) add(v.padStart(9, "0"));
@@ -149,10 +166,32 @@ function buildCandidates(norm) {
     }
   };
 
-  addNumberShapes(norm);
+  const hyph = hyphenForm(raw);
+  const alnum = normalizePro(raw);
 
-  const { rest } = detectLabel(norm);
-  if (rest) addNumberShapes(rest);
+  if (/^\d+$/.test(alnum) && hyph === alnum) {
+    // Purely numeric: the zero-padded nine-digit form is the Uline stop number,
+    // so it has to lead — the unpadded form almost never exists.
+    addNumberShapes(alnum);
+  } else {
+    // Otherwise the board's own convention comes first, so a carrier order
+    // resolves on the very first request.
+    add(hyph);
+    if (alnum !== hyph) add(alnum);
+    addNumberShapes(alnum);
+  }
+
+  const { rest, codes } = detectLabel(alnum);
+  if (rest) {
+    // Labelled but typed without the hyphen the board writes — rebuild it.
+    for (const code of codes) add(`${code}-${rest}`);
+    addNumberShapes(rest);
+  } else if (/^\d{10,11}$/.test(alnum)) {
+    // Ten or eleven digits, not the nine a Uline stop number has.
+    // A bare carrier PRO with no label at all: the board files it under a
+    // carrier prefix, so try the prefixes it actually writes.
+    for (const c of CARRIER_LABELS) for (const code of c.codes) add(`${code}-${alnum}`);
+  }
 
   return out;
 }
@@ -228,7 +267,7 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  const candidates = buildCandidates(norm);
+  const candidates = buildCandidates(rawPro);
   if (!candidates.length) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
