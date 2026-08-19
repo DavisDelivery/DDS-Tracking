@@ -338,6 +338,18 @@ exports.handler = async (event) => {
                   stopKeys: Object.keys(s.stop || {}),
                   exeKeys: Object.keys(s.stopExecutionInfo || {}),
                   stopNbr: (s.stop || {}).stopNbr,
+                  // The identifiers a customer might quote instead of the stop
+                  // number. NuVizz can only be queried by stopNbr, so seeing
+                  // what actually lands in these fields is the only way to tell
+                  // whether a carrier PRO is recorded at all.
+                  altIds: {
+                    stopId: (s.stop || {}).stopId,
+                    shipmentNbr: (s.stop || {}).shipmentNbr,
+                    proNumber: (s.stop || {}).proNumber,
+                    bol: (s.stop || {}).bol,
+                    reference1: (s.stop || {}).reference1,
+                    reference2: (s.stop || {}).reference2,
+                  },
                   stopType: (s.stop || {}).stopType,
                   stopSeq: (s.stop || {}).stopSeq,
                   seqNbr: (s.stop || {}).seqNbr,
