@@ -7,6 +7,30 @@
 <meta name="description" content="Rate your recent Davis Delivery Service shipment. Share your feedback about our delivery experience.">
 <meta name="robots" content="index, follow">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+<script src="/review-kit.js?v=2"></script>
+<script>
+/* If /review-kit.js fails to load — a 404, a blocked request, a stale CDN copy — this stub
+ * keeps the page working. Without it the failure is severe out of all proportion to its
+ * cause: index.html's render() clears #app BEFORE building, and the kit is first touched
+ * inside renderReviewCard, so a missing script leaves a BLANK WHITE PAGE for any delivered
+ * shipment. The customer came to track a delivery; losing the rating card is acceptable,
+ * losing the tracking is not.
+ *
+ * The stub degrades honestly rather than pretending: the Google link points straight at
+ * Google, so the hand-off still works and only the click measurement is lost. Measurement
+ * failing closed is the correct direction — an unrecorded click is a number we do not have,
+ * where a recorded-but-imaginary one is the bug this change exists to fix. */
+window.DDSReview=window.DDSReview||{
+  source:function(){return"direct"},
+  newRef:function(){return""},
+  googleHref:function(){return"https://g.page/r/CcBkxtEUiFOGEAE/review"},
+  postReview:function(p){try{return fetch("/.netlify/functions/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p),keepalive:true}).catch(function(){return null})}catch(e){return null}},
+  copyComment:function(){return null},
+  markSubmitted:function(){},
+  submittedRating:function(){return null},
+  FALLBACK:true
+};
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'DM Sans',system-ui,sans-serif;background:#f8f9fb;color:#1f2937;min-height:100vh}
@@ -38,6 +62,11 @@ function fmtDT(iso){if(!iso)return"";try{var d=new Date(iso);return d.toLocaleDa
 
 var pro=getParam("pro")||"";
 var selectedRating=0;
+// Minted once, up front, because the Google anchor's href has to be final at the moment it
+// is rendered — there is no round-trip to wait for. See public/review-kit.js.
+var src=DDSReview.source();
+var ref=DDSReview.newRef();
+var googleHref=DDSReview.googleHref(ref,src);
 var stopData=null;
 
 async function loadDelivery(){
@@ -135,7 +164,16 @@ function renderReview(){
   `;
   
   if(!isDelivered)return;
-  
+
+  // Already rated this delivery in this session? The 4-5 star hand-off navigates away, so
+  // coming back is the normal case. Showing five empty stars to someone who just rated
+  // reads as "your review was lost".
+  var already=DDSReview.submittedRating(pro);
+  if(already!==null&&!isNaN(already)){
+    if(already>=4)renderGoogleThanks(googleHref,already); else renderInternalThanks();
+    return;
+  }
+
   // Attach star handlers
   document.querySelectorAll(".star").forEach(function(star){
     star.addEventListener("click",function(){
@@ -180,11 +218,32 @@ function showForm(){
       <div style="height:10px"></div>
       <input id="rv-contact" type="text" placeholder="Phone or email (optional)">
       <div style="height:14px"></div>
-      <button id="rv-submit" class="btn-primary" style="width:100%;background:${B.blue}">Send Feedback</button>
+      ${submitControl(isHigh,googleHref,selectedRating)}
     </div>
   `;
   
-  document.getElementById("rv-submit").addEventListener("click",async function(){
+  var ctl=document.getElementById("rv-submit");
+  if(isHigh){
+    // THE HAND-OFF — see public/review-kit.js for the full account of why this is an
+    // anchor and not a button. No preventDefault: the browser owns this navigation.
+    // Everything here is synchronous, because an await would spend the gesture the
+    // clipboard write needs and put the POST behind the page unload.
+    ctl.addEventListener("click",function(){
+      var comment=document.getElementById("rv-comment").value;
+      var name=document.getElementById("rv-name").value;
+      var contactEl=document.getElementById("rv-contact");
+      var contact=contactEl?contactEl.value:"";
+      DDSReview.copyComment(comment);
+      DDSReview.postReview({rating:selectedRating,comment:comment,name:name,contact:contact,proNumber:pro,src:src,ref:ref});
+      DDSReview.markSubmitted(pro,selectedRating);
+      // The card is deliberately not rewritten here — removing the anchor mid-click can
+      // cancel the navigation. renderCard() shows the thank-you state on the way back.
+    });
+    return;
+  }
+
+  // 1-3 stars stay on this page, so awaiting the write costs the customer nothing.
+  ctl.addEventListener("click",async function(){
     var btn=this;
     btn.disabled=true;
     btn.textContent="Submitting...";
@@ -196,11 +255,12 @@ function showForm(){
       var res=await fetch("/.netlify/functions/review",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({rating:selectedRating,comment:comment,name:name,contact:contact,proNumber:pro})
+        body:JSON.stringify({rating:selectedRating,comment:comment,name:name,contact:contact,proNumber:pro,src:src,ref:ref})
       });
       var result=await res.json();
       if(result.success){
-        renderThankYou(result,comment);
+        DDSReview.markSubmitted(pro,selectedRating);
+        renderInternalThanks();
       } else {
         throw new Error("submit failed");
       }
@@ -212,44 +272,39 @@ function showForm(){
   });
 }
 
-function renderThankYou(result,commentText){
-  var card=document.getElementById("review-card");
-  if(result.routedTo==="google"&&result.googleUrl){
-    // Copy comment to clipboard if there is one
-    var hasComment=commentText&&commentText.trim().length>0;
-    var copyPromise=hasComment&&navigator.clipboard?navigator.clipboard.writeText(commentText.trim()).catch(function(){return false}):Promise.resolve(true);
-    
-    card.innerHTML=`
-      <div style="text-align:center;padding:24px 20px 20px">
-        <div style="font-size:52px;margin-bottom:12px">🎉</div>
-        <h2 style="font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;color:${B.dark};font-weight:800;margin-bottom:6px">Thank you!</h2>
-        <p style="color:${B.g600};font-size:14px;margin-bottom:16px;max-width:360px;margin-left:auto;margin-right:auto">Your feedback means the world to our family-owned business.</p>
-        ${hasComment?`
-          <div style="background:${B.accent}15;border:1px solid ${B.accent}40;border-radius:8px;padding:14px;margin:0 auto 18px;max-width:400px;text-align:left">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-              <span style="font-size:18px">📋</span>
-              <strong style="font-size:13px;color:${B.dark}">Your comment has been copied</strong>
-            </div>
-            <div style="font-size:12px;color:${B.g600};line-height:1.5">We've copied your text to your clipboard. On the next page, <strong>tap and hold the review box, then tap "Paste"</strong> to save time.</div>
-          </div>
-        `:''}
-        <a href="${result.googleUrl}" target="_blank" rel="noopener noreferrer" onclick="this.textContent='Opening Google...'" class="btn-primary" style="display:inline-block;text-decoration:none;background:${B.blue};padding:14px 32px">${hasComment?'Open Google to Paste &amp; Post':'Open Google Review'}</a>
-        <div style="margin-top:14px;font-size:11px;color:${B.g400}">Opens in a new tab</div>
-      </div>
-    `;
-    // Wait for clipboard copy to finish, then auto-open Google after short delay
-    copyPromise.then(function(){
-      setTimeout(function(){window.open(result.googleUrl,"_blank","noopener,noreferrer")},1800);
-    });
-  } else {
-    card.innerHTML=`
+function submitControl(isHigh,href,rating){
+  if(!isHigh)return `<button id="rv-submit" class="btn-primary" style="width:100%;background:${B.blue}">Send Feedback</button>`;
+  // An anchor, styled as the button. The rating is named back to them and never inflated.
+  // No target="_blank": that attribute is silently inert inside the iOS email webviews most
+  // of these customers arrive in, and it was very likely part of why the old manual button
+  // "never got tapped".
+  return `<a id="rv-submit" href="${href}" class="btn-primary" style="width:100%;background:${B.blue};display:block;text-align:center;text-decoration:none;box-sizing:border-box;min-height:48px;line-height:20px">Post My ${rating}-Star Review on Google</a>
+    <div style="font-size:11px;color:${B.g600};text-align:center;line-height:1.45;margin-top:8px">Takes about 30 seconds. You'll need to be signed in to Google.<br>Your feedback reaches us either way.</div>`;
+}
+
+function renderInternalThanks(){
+  document.getElementById("review-card").innerHTML=`
       <div style="text-align:center;padding:20px 20px 10px">
         <div style="font-size:52px;margin-bottom:12px">💙</div>
         <h2 style="font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;color:${B.dark};font-weight:800;margin-bottom:6px">Thank you for your feedback</h2>
         <p style="color:${B.g600};font-size:14px;max-width:380px;margin:0 auto">We've received your feedback and our team will review it personally. Someone from Davis Delivery will reach out soon to make this right.</p>
       </div>
     `;
-  }
+}
+
+// What they come back to after the hand-off. The link is still here on purpose: Google
+// sends a signed-out visitor to a sign-in page rather than a review box, and a good number
+// of people bounce off that on the first try. This is their second chance, not a new nag.
+function renderGoogleThanks(href,rating){
+  document.getElementById("review-card").innerHTML=`
+      <div style="text-align:center;padding:24px 20px 20px">
+        <div style="font-size:52px;margin-bottom:12px">🎉</div>
+        <h2 style="font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;color:${B.dark};font-weight:800;margin-bottom:6px">Thanks — that made our day.</h2>
+        <p style="color:${B.g600};font-size:14px;margin-bottom:18px;max-width:380px;margin-left:auto;margin-right:auto;line-height:1.5">We're family-owned, and reviews are how new customers find us. If you didn't get a chance to post it, the link is still here.</p>
+        <a href="${href}" class="btn-primary" style="display:block;max-width:320px;margin:0 auto;text-decoration:none;background:${B.blue};box-sizing:border-box;min-height:48px;line-height:20px">${rating >= 4 ? `Post My ${rating}-Star Review on Google` : 'Post My Review on Google'}</a>
+        <div style="margin-top:12px;font-size:11px;color:${B.g600}">Takes about 30 seconds. You'll need to be signed in to Google.</div>
+      </div>
+    `;
 }
 
 loadDelivery();

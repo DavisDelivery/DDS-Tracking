@@ -19,15 +19,47 @@
   to = "/admin.html"
   status = 200
 
+# The tracked Google hand-off. Short because it goes in emails and on a thank-you button.
+# status = 200 is a REWRITE, same as the /api/* rule above — Netlify proxies the request to
+# the function and passes the function's own status through, so the 302 g.js returns is the
+# 302 the browser sees. /api/g reaches the same function via the existing rule if this one
+# is ever removed.
+[[redirects]]
+  from = "/g"
+  to = "/.netlify/functions/g"
+  status = 200
+
+# The review follow-up runs on a schedule, not on a request. Declared here rather than with
+# the @netlify/functions helper so the repo keeps its zero-build, dependency-light shape —
+# and so the cadence is visible in config instead of buried in a handler.
+#
+# Hourly is not the send rate. Eligibility (lib/reviews followupEligible) is what decides
+# who gets mailed: a 2-hour floor, a 7-day ceiling, once ever, and only if the click hop
+# never saw them. Most runs will send nothing at all, which is the intended resting state.
+[functions."review-followup"]
+  schedule = "@hourly"
+
+# These advertised the site as GET-only while netlify/functions/review.js answers
+# "POST, GET, DELETE, OPTIONS" for itself. Harmless today because every call is same-origin
+# and CORS never engages — but wrong as documentation, and a trap for whoever next moves a
+# page to another origin and cannot work out why the preflight fails.
 [[headers]]
   for = "/*"
   [headers.values]
     Access-Control-Allow-Origin = "*"
-    Access-Control-Allow-Methods = "GET, OPTIONS"
+    Access-Control-Allow-Methods = "GET, POST, DELETE, OPTIONS"
     Access-Control-Allow-Headers = "Content-Type"
 
 # Keep the internal admin dashboard out of search engines
 [[headers]]
   for = "/admin*"
+  [headers.values]
+    X-Robots-Tag = "noindex, nofollow"
+
+# Same for the click hop — it is a per-customer link that lands in inboxes, and a crawler
+# following it would stamp a click nobody made. Exact path, not "/g*": a glob would also
+# claim every future route beginning with the letter g.
+[[headers]]
+  for = "/g"
   [headers.values]
     X-Robots-Tag = "noindex, nofollow"

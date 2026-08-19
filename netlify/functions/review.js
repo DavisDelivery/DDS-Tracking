@@ -12,8 +12,15 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 // NuVizz credentials — same env vars track.js uses. Reviews carry only a PRO,
 // so we resolve the delivering driver from NuVizz once (at submit time) and
-// store it on the review. Every reader (admin dashboard, MarginIQ Reviews tab,
-// Driver Scorecard Reviews tab) then gets per-driver attribution for free.
+// store it on the review, giving the dashboard per-driver attribution.
+//
+// This comment used to name a "MarginIQ Reviews tab" and a "Driver Scorecard
+// Reviews tab" as further readers. NEITHER EXISTS. Searched the dispatch app
+// for the blob store, this function's URL, DASHBOARD_KEY and the record's own
+// field names: nothing over there reads a review record at all. The only
+// consumers are public/admin.html and lib/followup-core.js, both in this repo.
+// Corrected rather than deleted because the false version was load-bearing —
+// it was cited as the reason not to rename routedTo.
 const DAVIS_USER = process.env.NUVIZZ_DAVIS_USER || "Chad";
 const DAVIS_PASS = process.env.NUVIZZ_DAVIS_PASS;
 const ULINE_USER = process.env.NUVIZZ_ULINE_USER || "Chad";
@@ -114,15 +121,13 @@ async function resolveDriver(rawPro) {
   }
 }
 
-function reviewsStore() {
-  const { getStore } = require("@netlify/blobs");
-  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
-  const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_API_TOKEN;
-  if (siteID && token) {
-    return getStore({ name: "reviews", siteID, token, consistency: "strong" });
-  }
-  return getStore({ name: "reviews", consistency: "strong" });
-}
+// The store, the Google URL and the source allow-list all live in lib/reviews now — the
+// click redirect and the follow-up mailer have to agree with this file about every one of
+// them, and three hand-copied definitions is how they stop agreeing.
+const {
+  GOOGLE_REVIEW_URL, reviewsStore, clicksStore, normalizeSource, SOURCE_LABEL,
+  trackedGoogleUrl, cleanRef, withClicks,
+} = require("./lib/reviews");
 
 exports.handler = async (event) => {
   const headers = {
@@ -184,12 +189,52 @@ exports.handler = async (event) => {
         rv.driverId = driverId;
         rv.driverResolved = true;
         rv.driverAttempts = attempts + 1;
-        try { await store.setJSON(rv.id, rv); } catch (e) { /* non-fatal */ }
+        // RE-READ, THEN MERGE ONLY THE DRIVER FIELDS. Writing `rv` back wholesale writes a
+        // record that was read at the top of this handler, before a NuVizz round-trip —
+        // and in that window the follow-up mailer may have stamped followupClaimedAt or
+        // followupSentAt on the same key. A blind write erases them, and the customer gets
+        // a second "would you post a review?" on the next hourly run. This dashboard
+        // auto-logs-in from localStorage, so this path runs on every admin page load.
+        try {
+          const current = (await store.get(rv.id, { type: "json" })) || rv;
+          await store.setJSON(rv.id, {
+            ...current,
+            driver: rv.driver,
+            driverId: rv.driverId,
+            driverResolved: true,
+            driverAttempts: rv.driverAttempts,
+          });
+        } catch (e) { /* non-fatal: the retry counter simply does not advance */ }
         backfilled++;
       }
 
       reviews.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
-      return { statusCode: 200, headers, body: JSON.stringify({ reviews, backfilled }) };
+
+      // Join the observed clicks on. Best-effort: if the click store is unreachable, every
+      // row reports googleClickAt: null, which reads as "we cannot show a click" rather than
+      // as "nobody clicked" — the dashboard is worded for that, and a dead store must not
+      // take the whole reviews list down with it.
+      let clicksByRef = {};
+      let clicksReadable = true;
+      try {
+        const clicks = clicksStore();
+        const refs = [...new Set(reviews.map((r) => r && r.clickRef).filter(Boolean))];
+        const rows = await Promise.all(refs.map(async (ref) => {
+          try { return [ref, await clicks.get(ref, { type: "json" })]; } catch { return [ref, null]; }
+        }));
+        for (const [ref, row] of rows) if (row) clicksByRef[ref] = row;
+      } catch (err) {
+        clicksReadable = false;
+        console.error("click store unreadable (non-fatal):", err && err.message);
+      }
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          reviews: withClicks(reviews, clicksByRef), backfilled, clicksReadable,
+        }),
+      };
     } catch (err) {
       console.error("Fetch reviews error:", err);
       return { statusCode: 500, headers, body: JSON.stringify({ error: "Fetch failed", detail: err.message }) };
@@ -217,9 +262,18 @@ exports.handler = async (event) => {
     }
     try {
       const store = reviewsStore();
+      const clicks = clicksStore();
       const deleted = [];
       for (const id of ids) {
-        try { await store.delete(id); deleted.push(id); } catch (e) { /* skip */ }
+        try {
+          // Take the click record with it. Deleting only the review leaves an orphan in
+          // review-clicks that nothing will ever read or clean up, and these ids are used
+          // to purge test records, so the orphans would be pure accumulation.
+          const row = await store.get(id, { type: "json" });
+          if (row && row.clickRef) { try { await clicks.delete(row.clickRef); } catch (e) { /* skip */ } }
+          await store.delete(id);
+          deleted.push(id);
+        } catch (e) { /* skip */ }
       }
       return { statusCode: 200, headers, body: JSON.stringify({ deleted }) };
     } catch (err) {
@@ -239,7 +293,7 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid JSON" }) };
   }
 
-  const { rating, comment, name, contact, proNumber } = payload;
+  const { rating, comment, name, contact, proNumber, src, ref } = payload;
 
   if (!rating || rating < 1 || rating > 5) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid rating" }) };
@@ -262,6 +316,22 @@ exports.handler = async (event) => {
     driverResolved: true,
     driverAttempts: 1,
     submittedAt: new Date().toISOString(),
+    // WHICH BUTTON THEY CAME FROM. Chad: "i want to track where the review came from
+    // tracking or delivery emails". The delivery email's two CTAs now carry src=review-email
+    // and src=track-email; a visit with no tag reads "direct". Allow-listed on the way in —
+    // this value arrives in a URL the customer can edit and is rendered on the dashboard.
+    source: normalizeSource(src),
+    // The browser-minted ref this submission's Google button points at. NOT the record's key
+    // — see lib/reviews. Null when the customer never had a Google button (a 1-3 star) or an
+    // old cached page posted without one; the join then simply finds no click, which is the
+    // truth.
+    clickRef: cleanRef(ref),
+    // KEPT EXACTLY AS IT WAS, deliberately. `routedTo` says which BRANCH the submission
+    // took — public (Google) or private (internal follow-up) — and downstream readers key
+    // off that. What it never meant, and was widely read as, is "a review reached Google".
+    // That question is now answered by googleClickAt, which g.js writes only when the
+    // customer actually takes the link. Renaming this would have broken the readers;
+    // leaving it while adding the honest field alongside does not.
     routedTo: rating >= 4 ? "google" : "internal",
   };
 
@@ -308,9 +378,13 @@ exports.handler = async (event) => {
           `,
         }),
       });
-      const emailResult = await emailRes.json();
+      // Status FIRST, and the body only as text. The last outage this file records was a
+      // silent HTTP 403 from Resend (see the header) — and the one number that would have
+      // diagnosed it was the one never captured. Worse, .json() ran before the ok-check, so
+      // a non-JSON error body threw and the outer catch reported a Resend rejection as
+      // "Email send error: Unexpected token", i.e. as a network fault.
       if (!emailRes.ok) {
-        console.error("Resend API error:", emailResult);
+        console.error("Resend API error:", emailRes.status, await emailRes.text().catch(() => "<unreadable body>"));
       }
     } catch (err) {
       console.error("Email send error:", err);
@@ -347,7 +421,8 @@ exports.handler = async (event) => {
                 <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
-                <p style="color:#666;font-size:12px;margin:4px 0">✅ The customer was also routed to leave this review on Google.</p>
+                <p style="color:#666;font-size:12px;margin:4px 0">🔗 They were handed the Google review link. Whether they actually took it shows on the dashboard — this email is sent the moment they hit Send, so at this instant nobody knows yet.</p>
+                <p style="color:#666;font-size:12px;margin:4px 0">📍 Came from: <strong>${SOURCE_LABEL[review.source] || review.source}</strong></p>
                 <p style="color:#666;font-size:12px;margin:4px 0">📊 <a href="https://davisdeliverytracking.netlify.app/admin" style="color:#1e5b92">View full dashboard</a></p>
               </div>
             </div>
@@ -355,14 +430,12 @@ exports.handler = async (event) => {
         }),
       });
       if (!posRes.ok) {
-        console.error("5-star email error:", await posRes.json());
+        console.error("5-star email error:", posRes.status, await posRes.text().catch(() => "<unreadable body>"));
       }
     } catch (err) {
       console.error("5-star email send error:", err);
     }
   }
-
-  const googleReviewUrl = "https://g.page/r/CcBkxtEUiFOGEAE/review";
 
   return {
     statusCode: 200,
@@ -370,7 +443,14 @@ exports.handler = async (event) => {
     body: JSON.stringify({
       success: true,
       routedTo: review.routedTo,
-      googleUrl: rating >= 4 ? googleReviewUrl : null,
+      // Kept for older cached pages, which still read googleUrl off this response and open
+      // it themselves. Current pages never wait for it: their Google button is an anchor
+      // whose href was final before this request was sent, because waiting on a POST is the
+      // thing that broke the hand-off in the first place.
+      googleUrl: rating >= 4 ? trackedGoogleUrl(review.clickRef || review.id) : null,
+      googleDirectUrl: rating >= 4 ? GOOGLE_REVIEW_URL : null,
+      reviewId: review.id,
+      source: review.source,
     }),
   };
 };
