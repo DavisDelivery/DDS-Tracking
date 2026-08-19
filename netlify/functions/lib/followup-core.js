@@ -47,34 +47,39 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 // the claim, so each eligible customer would be marked permanently un-nudgeable and the
 // entire backlog would be consumed one record per run with nothing but a console line to
 // show for it. Refusing to run is the only safe behaviour when the sender is unset.
-const MAIL_FROM = process.env.REVIEW_FROM || "";
+// REVIEW_FROM on this site is currently "Davis Delivery Alerts
+// <alerts@warehouse.davisdelivery.com>" — a verified sender, so this job can genuinely send,
+// which is the only thing that was actually blocking. But it is an INTERNAL-alerts identity:
+// a customer who gets "Davis Delivery Alerts" from a warehouse.* subdomain asking them to
+// post a review reads it as machinery, and mailbox providers score an alerts subdomain
+// differently from the one that already talks to customers.
+//
+// So this job takes an override and falls back. Set REVIEW_FOLLOWUP_FROM to a customer-
+// facing sender on the verified domain and nothing else changes; leave it unset and the job
+// still works, just signed as the alert robot.
+const MAIL_FROM = process.env.REVIEW_FOLLOWUP_FROM || process.env.REVIEW_FROM || "";
 // Where an unsubscribe or a reply lands. A real human address, because the email invites a
 // reply ("if you'd rather not, that's completely fine").
 const REPLY_TO = (process.env.REVIEW_EMAIL || "chad@davisdelivery.com").trim().toLowerCase();
 const SITE_ORIGIN = (process.env.REVIEW_SITE_ORIGIN || "https://tracking.davisdelivery.com").replace(/\/+$/, "");
 
-// OFF UNTIL CHAD SAYS OTHERWISE. Set REVIEW_FOLLOWUP_ENABLED=1 on the Netlify site to turn
-// it on; no deploy needed either way.
+// ON. Chad, after being shown the review-gating exposure below: "turn it on i'll take my
+// chances." His call, made with the risk in front of him, so it is the default now — and
+// REVIEW_FOLLOWUP_ENABLED=0 still switches it off from the Netlify UI without a deploy.
 //
-// Everything else in this change fixes something that was already broken. This is the one
-// piece that starts a NEW outbound conversation with customers, and it carries a business
-// question that is not a developer's to answer:
+// THE RISK HE ACCEPTED, recorded here because whoever reads this next will not have been in
+// the conversation: sending a "please post this on Google" nudge ONLY to 4-5 star raters is
+// review gating. Google's policies prohibit soliciting reviews selectively from customers
+// you already know are happy, and the penalty lands on the listing rather than on the code.
+// The portal has done a soft version of this for as long as it routed 4-5 stars out and 1-3
+// stars inward; a scheduled mailer that only ever writes to happy customers turns that from
+// a momentary page behaviour into a documented, repeating pattern.
 //
-//   Sending a "please post this on Google" nudge ONLY to 4-5 star raters is review gating.
-//   Google's policies prohibit soliciting reviews selectively from customers you already
-//   know are happy, and the penalty lands on the listing, not on the code. The portal has
-//   arguably done a soft version of this for as long as it has routed 4-5 stars to Google
-//   and 1-3 stars inward — but a page behaviour is momentary, whereas a scheduled mailer
-//   that only ever writes to happy customers is a documented, repeating pattern.
-//
-// So it ships complete, tested, and inert. Chad can enable it with one variable, or take
-// the other route — offer the Google link to everyone and give unhappy customers a
-// prominent "let us fix this first" path instead — which removes the exposure and, since
-// most raters are happy anyway, barely changes what actually gets posted.
-//
-// It is not disabled because it is unfinished. It is disabled because switching it on is a
-// decision about the business, and defaulting it on would be making that decision quietly.
-const ENABLED = String(process.env.REVIEW_FOLLOWUP_ENABLED ?? "0") === "1";
+// If it ever needs undoing, the fix is not to delete this job — it is to offer the Google
+// link to everyone and give unhappy customers a prominent "let us fix this first" path
+// first. That removes the exposure, and since most raters are happy anyway it barely
+// changes what actually gets posted.
+const ENABLED = String(process.env.REVIEW_FOLLOWUP_ENABLED ?? "1") !== "0";
 
 // Bounds, not targets. PER_RUN keeps one invocation inside its time limit; PER_DAY is the
 // blast radius if the eligibility rules are ever loosened by someone in a hurry.
