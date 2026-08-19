@@ -1,9 +1,5 @@
 const fetch = require("node-fetch");
 
-const DAVIS_USER = process.env.NUVIZZ_DAVIS_USER || "Chad";
-const DAVIS_PASS = process.env.NUVIZZ_DAVIS_PASS;
-const ULINE_USER = process.env.NUVIZZ_ULINE_USER || "Chad";
-const ULINE_PASS = process.env.NUVIZZ_ULINE_PASS;
 const BASE = "https://portal.nuvizz.com/deliverit/openapi/v7";
 
 // Davis runs Eastern time. NuVizz returns wall-clock timestamps with no zone
@@ -54,23 +50,196 @@ const LOAD_CACHE_TTL_MS = 60 * 1000;
 const LOAD_CACHE_MAX = 200;
 const loadCache = new Map();
 
-function getCachedLoad(loadNbr) {
-  const hit = loadCache.get(loadNbr);
+// Keyed by company + load number: the lookup now spans more than one company
+// code, and a load number is only unique within its own company.
+function getCachedLoad(key) {
+  const hit = loadCache.get(key);
   if (!hit) return null;
   if (Date.now() - hit.at > LOAD_CACHE_TTL_MS) {
-    loadCache.delete(loadNbr);
+    loadCache.delete(key);
     return null;
   }
   return hit.data;
 }
 
-function setCachedLoad(loadNbr, data) {
+function setCachedLoad(key, data) {
   // Bounded; Map preserves insertion order so the oldest key evicts first.
   if (loadCache.size >= LOAD_CACHE_MAX) {
     const oldest = loadCache.keys().next().value;
     if (oldest !== undefined) loadCache.delete(oldest);
   }
-  loadCache.set(loadNbr, { at: Date.now(), data });
+  loadCache.set(key, { at: Date.now(), data });
+}
+
+// Company codes a stop can live under, searched in order. Davis dispatches
+// most work under DAVIS and Uline-originated stops are filed under ULINE; the
+// lookup used to ask DAVIS only, so anything filed elsewhere was unfindable no
+// matter how the customer typed it.
+//
+// Credentials are per company code and authorize only that code — DAVIS
+// credentials against the ULINE company return 401, and vice versa. So
+// reaching an agent or carrier filed under its own company code needs its own
+// credentials, and NUVIZZ_COMPANIES adds one without a code change: list the
+// code here and supply NUVIZZ_<CODE>_USER / NUVIZZ_<CODE>_PASS, the same
+// naming the existing two already use.
+const COMPANIES = (process.env.NUVIZZ_COMPANIES || "DAVIS,ULINE")
+  .toUpperCase()
+  .split(",")
+  .map((c) => c.trim())
+  .filter(Boolean)
+  .map((code) => ({
+    code,
+    user: process.env[`NUVIZZ_${code}_USER`] || "Chad",
+    pass: process.env[`NUVIZZ_${code}_PASS`],
+  }));
+
+function authHeaderFor(company) {
+  if (!company.pass) return null;
+  return "Basic " + Buffer.from(`${company.user}:${company.pass}`).toString("base64");
+}
+
+// Carriers whose freight Davis runs the final mile for. The dispatch board
+// writes these orders into NuVizz with the carrier in the stop number itself —
+// "<CARRIER>-<PRO digits>", e.g. ESTES-0831846593 — so the hyphen is part of
+// the identifier, not punctuation to be cleaned off. `codes` are the prefixes
+// the board actually writes; `re` matches what a customer types.
+const CARRIER_LABELS = [
+  { name: "Estes Express", re: /^(?:ESTESEXPRESSLINES|ESTESEXPRESS|ESTES|EXLA)/, codes: ["ESTES"] },
+  { name: "Averitt Express", re: /^(?:AVERITTEXPRESS|AVERITT|AVRT)/, codes: ["AVRT", "AVERITT"] },
+];
+const GENERIC_LABEL = /^(?:PRONUMBER|PRONBR|PRO|TRACKINGNUMBER|TRACKING|BOLNUMBER|BOL)/;
+
+// Two normalizations, because two stop-number shapes are in play. Uline stops
+// are bare zero-padded digits; carrier stops carry a hyphenated prefix. Keeping
+// the hyphen is what makes "estes-0831846593" resolve — stripping it was why it
+// could not.
+function hyphenForm(raw) {
+  return String(raw == null ? "" : raw)
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizePro(raw) {
+  return String(raw == null ? "" : raw).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Split a recognised label off the front of an alphanumeric value. Returns the
+// carrier name (for the not-found message), the bare number underneath, and the
+// stop-number prefixes that carrier is filed under.
+function detectLabel(alnum) {
+  for (const c of CARRIER_LABELS) {
+    const m = alnum.match(c.re);
+    if (m && m[0].length < alnum.length && /^\d/.test(alnum.slice(m[0].length))) {
+      return { carrier: c.name, rest: alnum.slice(m[0].length), codes: c.codes };
+    }
+  }
+  const g = alnum.match(GENERIC_LABEL);
+  if (g && g[0].length < alnum.length && /^\d/.test(alnum.slice(g[0].length))) {
+    return { carrier: "", rest: alnum.slice(g[0].length), codes: [] };
+  }
+  return { carrier: "", rest: "", codes: [] };
+}
+
+const MAX_CANDIDATES = 8;
+const VALID_STOP_NBR = /^[A-Z0-9][A-Z0-9-]{1,38}[A-Z0-9]$/;
+
+// Every shape the same shipment might be filed under, most-likely first.
+function buildCandidates(raw) {
+  const out = [];
+  const add = (v) => {
+    if (!v || out.length >= MAX_CANDIDATES) return;
+    if (!VALID_STOP_NBR.test(v)) return;
+    if (!out.includes(v)) out.push(v);
+  };
+  // Uline-style stop numbers are zero-padded to nine digits and customers drop
+  // the padding; carrier PROs carry a leading zero that Uline numbers do not.
+  const addNumberShapes = (v) => {
+    if (!/^\d+$/.test(v)) { add(v); return; }
+    if (v.length < 9) add(v.padStart(9, "0"));
+    add(v);
+    const bare = v.replace(/^0+/, "");
+    if (bare && bare !== v) {
+      if (bare.length < 9) add(bare.padStart(9, "0"));
+      add(bare);
+    }
+  };
+
+  const hyph = hyphenForm(raw);
+  const alnum = normalizePro(raw);
+
+  if (/^\d+$/.test(alnum) && hyph === alnum) {
+    // Purely numeric: the zero-padded nine-digit form is the Uline stop number,
+    // so it has to lead — the unpadded form almost never exists.
+    addNumberShapes(alnum);
+  } else {
+    // Otherwise the board's own convention comes first, so a carrier order
+    // resolves on the very first request.
+    add(hyph);
+    if (alnum !== hyph) add(alnum);
+    addNumberShapes(alnum);
+  }
+
+  const { rest, codes } = detectLabel(alnum);
+  if (rest) {
+    // Labelled but typed without the hyphen the board writes — rebuild it.
+    for (const code of codes) add(`${code}-${rest}`);
+    addNumberShapes(rest);
+  } else if (/^\d{10,11}$/.test(alnum)) {
+    // Ten or eleven digits, not the nine a Uline stop number has.
+    // A bare carrier PRO with no label at all: the board files it under a
+    // carrier prefix, so try the prefixes it actually writes.
+    for (const c of CARRIER_LABELS) for (const code of c.codes) add(`${code}-${alnum}`);
+  }
+
+  return out;
+}
+
+async function fetchStop(cand, companyCode, auth) {
+  const res = await fetch(`${BASE}/stop/info/${encodeURIComponent(cand)}/${companyCode}`, {
+    headers: { Authorization: auth },
+  });
+  if (!res.ok) return null;
+  const json = await res.json().catch(() => null);
+  return json && json.Stop && json.Stop.stop ? json : null;
+}
+
+// Resolve a stop across every candidate shape and every company code.
+//
+// The happy path is unchanged in cost: a well-formed stop number is one
+// request against DAVIS, exactly as before. The wider fan-out only runs for
+// lookups that previously ended in a flat "Shipment Not Found", so nothing
+// that works today gets slower.
+async function resolveStop(candidates) {
+  const companies = COMPANIES
+    .map((c) => ({ code: c.code, auth: authHeaderFor(c) }))
+    .filter((c) => c.auth);
+  const tried = [];
+  const miss = { data: null, company: "", matched: "", tried };
+
+  if (!candidates.length) return miss;
+
+  for (const company of companies) {
+    const head = candidates[0];
+    tried.push(`${head}@${company.code}`);
+    const first = await fetchStop(head, company.code, company.auth).catch(() => null);
+    if (first) return { data: first, company: company.code, matched: head, tried };
+
+    const rest = candidates.slice(1);
+    if (!rest.length) continue;
+    for (const c of rest) tried.push(`${c}@${company.code}`);
+    const results = await Promise.all(
+      rest.map((c) => fetchStop(c, company.code, company.auth).catch(() => null))
+    );
+    // findIndex keeps candidate priority even though the calls ran together.
+    const hit = results.findIndex(Boolean);
+    if (hit !== -1) {
+      return { data: results[hit], company: company.code, matched: rest[hit], tried };
+    }
+  }
+
+  return miss;
 }
 
 exports.handler = async (event) => {
@@ -89,48 +258,99 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing pro parameter" }) };
   }
 
-  // Davis serves multiple customers with different stop-number formats, all
-  // resolvable via the DAVIS company code. Build a list of candidates to try:
-  //  - Uline style: all-digits, usually zero-padded to 9 (e.g. 007107386)
-  //  - Prefixed style: ARY/MCC/SHP + digits (e.g. ARY245516, SHP27000) -> use as-is
-  const trimmed = rawPro.trim().toUpperCase();
-  if (!trimmed) {
+  // Davis serves several customers and several linehaul carriers, each with a
+  // different number format, and the number reaches us in whatever shape the
+  // customer's paperwork printed it. Normalize first, then try every plausible
+  // shape of it against every company code we hold credentials for.
+  const norm = normalizePro(rawPro);
+  if (!norm) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  let candidates;
-  if (/^\d+$/.test(trimmed)) {
-    const padded = trimmed.padStart(9, "0");
-    candidates = padded === trimmed ? [trimmed] : [padded, trimmed];
-  } else if (/^[A-Z0-9]+$/.test(trimmed)) {
-    candidates = [trimmed];
-  } else {
+  const candidates = buildCandidates(rawPro);
+  if (!candidates.length) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid PRO number" }) };
   }
 
-  const davisAuth = Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
+  const { carrier } = detectLabel(norm);
 
-  try {
-    // Call 1: resolve the stop. Try each candidate against /stop/info/{stopNbr}/DAVIS
-    let stopData = null;
-    let stopNbr = null;
-    for (const cand of candidates) {
-      const stopRes = await fetch(`${BASE}/stop/info/${cand}/DAVIS`, {
-        headers: { Authorization: `Basic ${davisAuth}` },
-      });
-      if (stopRes.ok) {
-        const json = await stopRes.json();
-        if (json && json.Stop && json.Stop.stop) {
-          stopData = json;
-          stopNbr = json.Stop.stop.stopNbr || cand;
-          break;
+  const qsp = event.queryStringParameters || {};
+  const debugOk = qsp.debug === "1" && qsp.key === (process.env.DASHBOARD_KEY || "davis2026");
+
+  // Key-gated: probe company codes we hold no dedicated credentials for.
+  // NuVizz tenants commonly file each customer or agent under its own company
+  // code, so "which company is this stop filed under" is a question worth
+  // being able to ask without a redeploy. Reports the raw HTTP status per
+  // candidate so a 401 (code exists, wrong credentials) is distinguishable
+  // from a 404 (no such stop).
+  if (debugOk && qsp.co) {
+    const codes = String(qsp.co).toUpperCase().split(",").map((c) => c.trim()).filter(Boolean).slice(0, 8);
+    const creds = COMPANIES.filter((c) => c.pass);
+    const probes = [];
+    for (const code of codes) {
+      for (const cred of creds) {
+        for (const cand of candidates) {
+          probes.push({ code, as: cred.code, cand });
         }
       }
     }
+    const out = await Promise.all(probes.slice(0, 60).map(async (pr) => {
+      const cred = COMPANIES.find((c) => c.code === pr.as);
+      try {
+        const r = await fetch(`${BASE}/stop/info/${encodeURIComponent(pr.cand)}/${pr.code}`, {
+          headers: { Authorization: authHeaderFor(cred) },
+        });
+        return `${pr.cand}@${pr.code} as ${pr.as} -> ${r.status}`;
+      } catch (e) {
+        return `${pr.cand}@${pr.code} as ${pr.as} -> ERR ${e.message}`;
+      }
+    }));
+    return { statusCode: 200, headers, body: JSON.stringify({ probe: out }, null, 2) };
+  }
+
+  try {
+    const resolved = await resolveStop(candidates);
+    const stopData = resolved.data;
+    const companyCode = resolved.company || "DAVIS";
+    const auth = authHeaderFor(
+      COMPANIES.find((c) => c.code === companyCode) || COMPANIES[0]
+    );
 
     if (!stopData) {
-      return { statusCode: 404, headers, body: JSON.stringify({ error: "No data for this PRO" }) };
+      // "Why can't I track this?" is answerable only if we can see what was
+      // actually asked for, so the key-gated trace has to survive a miss —
+      // that is the case worth diagnosing.
+      const dq = event.queryStringParameters || {};
+      if (dq.debug === "1" && dq.key === (process.env.DASHBOARD_KEY || "davis2026")) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            found: false,
+            input: { raw: rawPro, normalized: norm, carrier },
+            candidates,
+            tried: resolved.tried,
+            companiesConfigured: COMPANIES.filter((c) => c.pass).map((c) => c.code),
+          }, null, 2),
+        };
+      }
+
+      // Say which shapes were actually looked up, and name the carrier when the
+      // number was labelled with one. A customer holding a linehaul carrier's
+      // PRO needs to know that number is not what identifies the stop here,
+      // not just that we came up empty.
+      return {
+        statusCode: 404,
+        headers,
+        body: JSON.stringify({
+          error: "No data for this PRO",
+          searched: candidates,
+          carrier: carrier || "",
+        }),
+      };
     }
+
+    const stopNbr = stopData.Stop.stop.stopNbr || resolved.matched;
 
     const stop = stopData.Stop.stop;
     const load = stopData.Stop.load || {};
@@ -152,14 +372,15 @@ exports.handler = async (event) => {
     let latenessMs = 0;
     if (load && load.loadNbr) {
       try {
-        let loadData = getCachedLoad(load.loadNbr);
+        const loadKey = `${companyCode}:${load.loadNbr}`;
+        let loadData = getCachedLoad(loadKey);
         if (!loadData) {
-          const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/DAVIS`, {
-            headers: { Authorization: `Basic ${davisAuth}` },
+          const loadRes = await fetch(`${BASE}/load/info/${load.loadNbr}/${companyCode}`, {
+            headers: { Authorization: auth },
           });
           if (loadRes.ok) {
             loadData = await loadRes.json();
-            setCachedLoad(load.loadNbr, loadData);
+            setCachedLoad(loadKey, loadData);
           }
         }
         if (loadData) {
@@ -179,6 +400,9 @@ exports.handler = async (event) => {
               headers,
               body: JSON.stringify({
                 lookingFor: stopNbr,
+                input: { raw: rawPro, normalized: norm, candidates, carrier },
+                resolvedBy: { candidate: resolved.matched, company: companyCode },
+                tried: resolved.tried,
                 loadNbr: load.loadNbr,
                 loadKeys: Object.keys((loadData && loadData.Load) || {}),
                 lexeKeys: Object.keys(lexe),
@@ -187,6 +411,18 @@ exports.handler = async (event) => {
                   stopKeys: Object.keys(s.stop || {}),
                   exeKeys: Object.keys(s.stopExecutionInfo || {}),
                   stopNbr: (s.stop || {}).stopNbr,
+                  // The identifiers a customer might quote instead of the stop
+                  // number. NuVizz can only be queried by stopNbr, so seeing
+                  // what actually lands in these fields is the only way to tell
+                  // whether a carrier PRO is recorded at all.
+                  altIds: {
+                    stopId: (s.stop || {}).stopId,
+                    shipmentNbr: (s.stop || {}).shipmentNbr,
+                    proNumber: (s.stop || {}).proNumber,
+                    bol: (s.stop || {}).bol,
+                    reference1: (s.stop || {}).reference1,
+                    reference2: (s.stop || {}).reference2,
+                  },
                   stopType: (s.stop || {}).stopType,
                   stopSeq: (s.stop || {}).stopSeq,
                   seqNbr: (s.stop || {}).seqNbr,
@@ -417,6 +653,8 @@ exports.handler = async (event) => {
       eta: etaInfo,
       stopsAway,
       stopsOnRoute,
+      company: companyCode,
+      matchedPro: resolved.matched,
     };
 
     return { statusCode: 200, headers, body: JSON.stringify(result) };

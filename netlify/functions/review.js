@@ -42,18 +42,33 @@ function firstVal(obj, paths) {
 // Resolve { driver, driverId } for a PRO via NuVizz. Best-effort: returns empty
 // strings (never throws) so a NuVizz hiccup never blocks a review submission.
 async function resolveDriver(rawPro) {
-  const trimmed = (rawPro || "").trim().toUpperCase();
-  if (!trimmed || !DAVIS_PASS) return { driver: "", driverId: "" };
+  // Same normalization the tracking lookup uses: a review can be submitted with
+  // whatever the customer had in front of them ("SHP-27000", "PRO # 007107386",
+  // "estes-0831846593"), and punctuation used to drop driver attribution
+  // entirely. Carrier orders are filed under a hyphenated stop number, so the
+  // hyphen is kept as well as stripped.
+  const hyph = String(rawPro == null ? "" : rawPro)
+    .toUpperCase().replace(/[^A-Z0-9-]+/g, "").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+  const norm = String(rawPro == null ? "" : rawPro).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!norm || !DAVIS_PASS) return { driver: "", driverId: "" };
 
-  let candidates;
-  if (/^\d+$/.test(trimmed)) {
-    const padded = trimmed.padStart(9, "0");
-    candidates = padded === trimmed ? [trimmed] : [padded, trimmed];
-  } else if (/^[A-Z0-9]+$/.test(trimmed)) {
-    candidates = [trimmed];
+  const candidates = [];
+  const add = (v) => {
+    if (v && /^[A-Z0-9][A-Z0-9-]{1,38}[A-Z0-9]$/.test(v) && !candidates.includes(v)) candidates.push(v);
+  };
+  if (hyph !== norm) add(hyph);
+  if (/^\d+$/.test(norm)) {
+    if (norm.length < 9) add(norm.padStart(9, "0"));
+    add(norm);
+    const bare = norm.replace(/^0+/, "");
+    if (bare && bare !== norm) {
+      if (bare.length < 9) add(bare.padStart(9, "0"));
+      add(bare);
+    }
   } else {
-    return { driver: "", driverId: "" };
+    add(norm);
   }
+  if (!candidates.length) return { driver: "", driverId: "" };
 
   const davisAuth = "Basic " + Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
 
