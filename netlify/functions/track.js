@@ -244,6 +244,24 @@ exports.handler = async (event) => {
     );
 
     if (!stopData) {
+      // "Why can't I track this?" is answerable only if we can see what was
+      // actually asked for, so the key-gated trace has to survive a miss —
+      // that is the case worth diagnosing.
+      const dq = event.queryStringParameters || {};
+      if (dq.debug === "1" && dq.key === (process.env.DASHBOARD_KEY || "davis2026")) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            found: false,
+            input: { raw: rawPro, normalized: norm, carrier },
+            candidates,
+            tried: resolved.tried,
+            companiesConfigured: COMPANIES.filter((c) => c.pass).map((c) => c.code),
+          }, null, 2),
+        };
+      }
+
       // Say which shapes were actually looked up, and name the carrier when the
       // number was labelled with one. A customer holding a linehaul carrier's
       // PRO needs to know that number is not what identifies the stop here,
