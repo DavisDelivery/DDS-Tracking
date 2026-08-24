@@ -39,8 +39,13 @@ function firstVal(obj, paths) {
   return "";
 }
 
-// Resolve { driver, driverId } for a PRO via NuVizz. Best-effort: returns empty
+// Resolve { driver, driverId, wrap } for a PRO via NuVizz. Best-effort: returns empty
 // strings (never throws) so a NuVizz hiccup never blocks a review submission.
+//
+// `wrap` is the WHOLE /stop/info response object this call already paid for. It used to be
+// read for two fields and discarded, while the customer of record and the delivery-photo
+// references — both things the alert email was missing — were sitting in it the entire time.
+// Returning it is what makes the customer block cost ZERO extra NuVizz calls.
 async function resolveDriver(rawPro) {
   // Same normalization the tracking lookup uses: a review can be submitted with
   // whatever the customer had in front of them ("SHP-27000", "PRO # 007107386",
@@ -50,7 +55,7 @@ async function resolveDriver(rawPro) {
   const hyph = String(rawPro == null ? "" : rawPro)
     .toUpperCase().replace(/[^A-Z0-9-]+/g, "").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
   const norm = String(rawPro == null ? "" : rawPro).toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (!norm || !DAVIS_PASS) return { driver: "", driverId: "" };
+  if (!norm || !DAVIS_PASS) return { driver: "", driverId: "", wrap: null };
 
   const candidates = [];
   const add = (v) => {
@@ -68,7 +73,7 @@ async function resolveDriver(rawPro) {
   } else {
     add(norm);
   }
-  if (!candidates.length) return { driver: "", driverId: "" };
+  if (!candidates.length) return { driver: "", driverId: "", wrap: null };
 
   const davisAuth = "Basic " + Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
 
@@ -88,7 +93,7 @@ async function resolveDriver(rawPro) {
         }
       }
     }
-    if (!stopData) return { driver: "", driverId: "" };
+    if (!stopData) return { driver: "", driverId: "", wrap: null };
 
     // The assigned driver rides on the load object embedded in the stop
     // response (load.driverName / load.driverId) — check there first, then
@@ -114,10 +119,10 @@ async function resolveDriver(rawPro) {
           firstVal(lexe, ["driverId", "driver.driverId", "driver.id"]);
       }
     }
-    return { driver: driver || "", driverId: driverId || "" };
+    return { driver: driver || "", driverId: driverId || "", wrap: stopData };
   } catch (err) {
     console.log("resolveDriver error (non-fatal):", err.message);
-    return { driver: "", driverId: "" };
+    return { driver: "", driverId: "", wrap: null };
   }
 }
 
@@ -128,6 +133,97 @@ const {
   GOOGLE_REVIEW_URL, reviewsStore, clicksStore, normalizeSource, SOURCE_LABEL,
   trackedGoogleUrl, cleanRef, withClicks,
 } = require("./lib/reviews");
+
+const {
+  extractCustomer, extractPodDocs, selectPhotos, fitWithinBudget,
+  attachmentName, customerBlockHtml, photosBlockHtml,
+} = require("./lib/stop-context");
+
+// Proof-of-delivery image bytes come from the deliverIt *documentapi*, NOT the v7 OpenAPI
+// this file otherwise talks to. Mirrors dispatch-map/netlify/functions/nuvizz-pod.mts, which
+// is the proven implementation: company order [ULINE, DAVIS] (Uline docs sometimes resolve
+// under DAVIS; a 404 means wrong company, try the next), across both hosts.
+const DOC_BASE = process.env.NUVIZZ_DOC_BASE || "https://portal.nuvizz.com/deliverit/openapi/documentapi";
+const DOC_FAILOVER = (u) => u.replace("portal.nuvizz.com", "contact-support.nuvizz.com");
+
+function docAuthHeader() {
+  const u = process.env.NUVIZZ_DOC_USER, p = process.env.NUVIZZ_DOC_PASS;
+  if (u && p) return "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
+  if (ULINE_PASS) return "Basic " + Buffer.from(`${ULINE_USER}:${ULINE_PASS}`).toString("base64");
+  return "Basic " + Buffer.from(`${DAVIS_USER}:${DAVIS_PASS || ""}`).toString("base64");
+}
+
+// One document's base64 bytes, or null. NEVER THROWS — a photo that will not load must cost
+// the alert nothing. The email says how many are missing rather than failing to arrive.
+async function fetchDocBase64(doc) {
+  let guid = doc.documentGuid || "";
+  let ext = (doc.extension || "").toLowerCase();
+  let cc = "";
+  if (!guid && doc.documentPath) {
+    const sp = new URLSearchParams(doc.documentPath.startsWith("?") ? doc.documentPath.slice(1) : doc.documentPath);
+    guid = sp.get("docGuid") || sp.get("documentGuid") || "";
+    ext = ext || (sp.get("ext") || sp.get("extension") || "").toLowerCase();
+    cc = sp.get("cc") || "";
+  }
+  if (!guid) return null;
+  ext = ext || "jpg";
+  const auth = docAuthHeader();
+  const companies = [...new Set([cc, "ULINE", "DAVIS"].filter(Boolean).map((s) => s.toUpperCase()))];
+  for (const base of [DOC_BASE, DOC_FAILOVER(DOC_BASE)]) {
+    for (const company of companies) {
+      try {
+        const target = `${base}/doc/getdocument/${encodeURIComponent(company)}`
+          + `?documentGuid=${encodeURIComponent(guid)}&objectType=02&extension=${encodeURIComponent(ext)}`;
+        const r = await fetch(target, { headers: { Authorization: auth, Accept: "application/json" } });
+        if (!r.ok) continue;
+        const j = await r.json();
+        const b64 = j && (j.documentData || j.documentdata);
+        if (typeof b64 === "string" && b64) {
+          // base64 inflates by 4/3; the real payload size is what the budget cares about.
+          return { base64: b64, bytes: Math.floor(b64.length * 0.75) };
+        }
+      } catch { /* next company / host */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * The delivery photos for a stop, as Resend attachments, plus an honest count of what did
+ * not make it. Costs one documentapi call PER PHOTO (capped at MAX_PHOTOS) — the customer
+ * block above it costs none, since it reads the stop response resolveDriver already fetched.
+ *
+ * Best-effort throughout: any failure yields fewer photos, never a lost review or alert.
+ */
+async function collectDeliveryPhotos(wrap, pro) {
+  const empty = { attachments: [], block: { attached: [], missing: 0, otherDocs: [] } };
+  if (!wrap) return empty;
+  try {
+    const docs = extractPodDocs(wrap);
+    if (!docs.length) return empty;
+    const { photos, skippedPhotos, otherDocs } = selectPhotos(docs);
+    const fetched = [];
+    for (let i = 0; i < photos.length; i++) {
+      const got = await fetchDocBase64(photos[i]);
+      if (got) fetched.push({ ...got, filename: attachmentName(pro, i, photos[i]), createdTime: photos[i].createdTime });
+    }
+    const { kept, dropped } = fitWithinBudget(fetched);
+    return {
+      attachments: kept.map((k) => ({ filename: k.filename, content: k.base64 })),
+      block: {
+        attached: kept.map((k) => ({ filename: k.filename, createdTime: k.createdTime })),
+        // Everything the owner is NOT looking at: over the cap, over the byte ceiling, or
+        // simply would not fetch. Counted together because the action is the same — open
+        // the dashboard — and three separate numbers would be noise in an alert.
+        missing: skippedPhotos.length + dropped.length + (photos.length - fetched.length),
+        otherDocs,
+      },
+    };
+  } catch (err) {
+    console.log("collectDeliveryPhotos error (non-fatal):", err.message);
+    return empty;
+  }
+}
 
 exports.handler = async (event) => {
   const headers = {
@@ -302,7 +398,23 @@ exports.handler = async (event) => {
   const proClean = (proNumber || "").trim().slice(0, 50);
 
   // Resolve the delivering driver up front so every reader is attributed.
-  const { driver, driverId } = await resolveDriver(proClean);
+  const { driver, driverId, wrap } = await resolveDriver(proClean);
+
+  // WHO IT WAS FOR, AND WHAT THE DRIVER PHOTOGRAPHED. Chad: "these emails ... i want to start
+  // to include the customers information and the photos of the delivery."
+  //
+  // Built ONCE here and shared by both alert templates below. The customer block is a pure
+  // read of the response resolveDriver already fetched, so it adds no NuVizz calls; the
+  // photos cost one documentapi call each, capped in lib/stop-context.
+  //
+  // Only fetched when an alert is actually going out. A 4-star routes straight to Google
+  // with no email, and paying for photos nobody will look at is how a per-review cost turns
+  // into a bill.
+  const willAlert = !!RESEND_API_KEY && (rating <= 3 || rating === 5);
+  const customer = wrap ? extractCustomer(wrap) : null;
+  const photos = willAlert ? await collectDeliveryPhotos(wrap, proClean) : { attachments: [], block: {} };
+  const customerHtml = customerBlockHtml(customer);
+  const photosHtml = photosBlockHtml(photos.block);
 
   const review = {
     id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
@@ -357,6 +469,7 @@ exports.handler = async (event) => {
           to: REVIEW_EMAIL,
           reply_to: REVIEW_EMAIL,
           subject: `⚠️ ${rating}-Star Review — PRO# ${review.proNumber || "Unknown"}`,
+          ...(photos.attachments.length ? { attachments: photos.attachments } : {}),
           html: `
             <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;padding:20px">
               <div style="background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:20px;border-radius:8px;margin-bottom:16px">
@@ -367,9 +480,11 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">${"★".repeat(rating)}<span style="color:#dde2e8">${"★".repeat(5 - rating)}</span></div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Name:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${review.name || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${review.contact || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#fef5f5;padding:16px;border-left:4px solid #d63b3b;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                ${customerHtml}
+                ${photosHtml}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">🔒 This review was captured internally and was NOT sent to Google.</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">📊 <a href="https://davisdeliverytracking.netlify.app/admin" style="color:#1e5b92">View full dashboard</a></p>
@@ -407,6 +522,7 @@ exports.handler = async (event) => {
           to: REVIEW_EMAIL,
           reply_to: REVIEW_EMAIL,
           subject: `⭐ 5-Star Review — PRO# ${review.proNumber || "Unknown"}`,
+          ...(photos.attachments.length ? { attachments: photos.attachments } : {}),
           html: `
             <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;padding:20px">
               <div style="background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:20px;border-radius:8px;margin-bottom:16px">
@@ -417,9 +533,11 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">★★★★★</div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Name:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${review.name || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${review.contact || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                ${customerHtml}
+                ${photosHtml}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">🔗 They were handed the Google review link. Whether they actually took it shows on the dashboard — this email is sent the moment they hit Send, so at this instant nobody knows yet.</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">📍 Came from: <strong>${SOURCE_LABEL[review.source] || review.source}</strong></p>
