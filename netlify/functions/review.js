@@ -400,22 +400,6 @@ exports.handler = async (event) => {
   // Resolve the delivering driver up front so every reader is attributed.
   const { driver, driverId, wrap } = await resolveDriver(proClean);
 
-  // WHO IT WAS FOR, AND WHAT THE DRIVER PHOTOGRAPHED. Chad: "these emails ... i want to start
-  // to include the customers information and the photos of the delivery."
-  //
-  // Built ONCE here and shared by both alert templates below. The customer block is a pure
-  // read of the response resolveDriver already fetched, so it adds no NuVizz calls; the
-  // photos cost one documentapi call each, capped in lib/stop-context.
-  //
-  // Only fetched when an alert is actually going out. A 4-star routes straight to Google
-  // with no email, and paying for photos nobody will look at is how a per-review cost turns
-  // into a bill.
-  const willAlert = !!RESEND_API_KEY && (rating <= 3 || rating === 5);
-  const customer = wrap ? extractCustomer(wrap) : null;
-  const photos = willAlert ? await collectDeliveryPhotos(wrap, proClean) : { attachments: [], block: {} };
-  const customerHtml = customerBlockHtml(customer);
-  const photosHtml = photosBlockHtml(photos.block);
-
   const review = {
     id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
     rating: Number(rating),
@@ -454,6 +438,30 @@ exports.handler = async (event) => {
   } catch (err) {
     console.error("Blob storage error:", err);
   }
+
+  // WHO IT WAS FOR, AND WHAT THE DRIVER PHOTOGRAPHED. Chad: "these emails ... i want to start
+  // to include the customers information and the photos of the delivery."
+  //
+  // DELIBERATELY AFTER THE BLOB WRITE, and that ordering is the whole safety of this feature.
+  // Fetching photos means up to six sequential multi-megabyte downloads from the NuVizz
+  // document API. Netlify gives a synchronous function a hard execution ceiling, and this
+  // handler's FIRST duty is not losing what the customer typed. Run the enrichment before the
+  // write and a slow document server does not merely cost the photos — it costs the review
+  // itself, silently, on the endpoint whose entire job is to capture it. The alert can degrade
+  // to no photos; the review may not degrade to nothing.
+  //
+  // The customer block is a pure read of the response resolveDriver already fetched, so it
+  // adds no NuVizz calls. Only the photo BYTES cost anything, one documentapi call each,
+  // capped in lib/stop-context.
+  //
+  // Only fetched when an alert is actually going out. A 4-star routes straight to Google with
+  // no email, and paying for photos nobody will look at is how a per-review cost turns into
+  // a bill.
+  const willAlert = !!RESEND_API_KEY && (rating <= 3 || rating === 5);
+  const customer = wrap ? extractCustomer(wrap) : null;
+  const photos = willAlert ? await collectDeliveryPhotos(wrap, proClean) : { attachments: [], block: {} };
+  const customerHtml = customerBlockHtml(customer);
+  const photosHtml = photosBlockHtml(photos.block);
 
   // Email if rating is 3 or below
   if (rating <= 3 && RESEND_API_KEY) {

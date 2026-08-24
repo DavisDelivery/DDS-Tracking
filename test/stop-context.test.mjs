@@ -276,3 +276,28 @@ test('THE REVIEWER AND THE CUSTOMER ARE LABELLED APART', () => {
   assert.ok(!/<strong>Name:<\/strong>/.test(REVIEW), 'the ambiguous "Name:" label is gone');
   assert.ok(!/<strong>Contact:<\/strong>/.test(REVIEW), 'the ambiguous "Contact:" label is gone');
 });
+
+test('THE REVIEW IS STORED BEFORE ANY PHOTO IS FETCHED', () => {
+  // The bug this pins: enrichment ran before the blob write. Fetching photos means up to six
+  // sequential multi-megabyte downloads, and Netlify caps how long a synchronous function may
+  // run — so a slow document server would not merely cost the photos, it would cost THE
+  // REVIEW, silently, on the endpoint whose entire job is to capture it.
+  //
+  // The customer's words are the irreplaceable thing here. The photos are a convenience.
+  // Ordering encodes which one is allowed to fail.
+  const write = REVIEW.indexOf('await store.setJSON(review.id, review)');
+  const fetchPhotos = REVIEW.indexOf('await collectDeliveryPhotos(wrap, proClean)');
+  assert.ok(write > 0 && fetchPhotos > 0, 'found both the blob write and the photo fetch');
+  assert.ok(write < fetchPhotos,
+    'the review must be persisted BEFORE the photo fetch — otherwise a slow NuVizz loses it');
+});
+
+test('nothing between the review being built and it being stored can go to the network', () => {
+  // Same rule, stated so a future edit that slips an await in there fails rather than
+  // quietly reopening the window.
+  const start = REVIEW.indexOf('const review = {');
+  const write = REVIEW.indexOf('await store.setJSON(review.id, review)');
+  const between = REVIEW.slice(start, write);
+  assert.ok(!/collectDeliveryPhotos|fetchDocBase64|api\.resend\.com/.test(between),
+    'no network call may sit between building the review and storing it');
+});
