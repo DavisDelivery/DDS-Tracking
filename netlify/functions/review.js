@@ -39,8 +39,13 @@ function firstVal(obj, paths) {
   return "";
 }
 
-// Resolve { driver, driverId } for a PRO via NuVizz. Best-effort: returns empty
+// Resolve { driver, driverId, wrap } for a PRO via NuVizz. Best-effort: returns empty
 // strings (never throws) so a NuVizz hiccup never blocks a review submission.
+//
+// `wrap` is the WHOLE /stop/info response object this call already paid for. It used to be
+// read for two fields and discarded, while the customer of record and the delivery-photo
+// references — both things the alert email was missing — were sitting in it the entire time.
+// Returning it is what makes the customer block cost ZERO extra NuVizz calls.
 async function resolveDriver(rawPro) {
   // Same normalization the tracking lookup uses: a review can be submitted with
   // whatever the customer had in front of them ("SHP-27000", "PRO # 007107386",
@@ -50,7 +55,7 @@ async function resolveDriver(rawPro) {
   const hyph = String(rawPro == null ? "" : rawPro)
     .toUpperCase().replace(/[^A-Z0-9-]+/g, "").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
   const norm = String(rawPro == null ? "" : rawPro).toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (!norm || !DAVIS_PASS) return { driver: "", driverId: "" };
+  if (!norm || !DAVIS_PASS) return { driver: "", driverId: "", wrap: null };
 
   const candidates = [];
   const add = (v) => {
@@ -68,7 +73,7 @@ async function resolveDriver(rawPro) {
   } else {
     add(norm);
   }
-  if (!candidates.length) return { driver: "", driverId: "" };
+  if (!candidates.length) return { driver: "", driverId: "", wrap: null };
 
   const davisAuth = "Basic " + Buffer.from(`${DAVIS_USER}:${DAVIS_PASS}`).toString("base64");
 
@@ -88,7 +93,7 @@ async function resolveDriver(rawPro) {
         }
       }
     }
-    if (!stopData) return { driver: "", driverId: "" };
+    if (!stopData) return { driver: "", driverId: "", wrap: null };
 
     // The assigned driver rides on the load object embedded in the stop
     // response (load.driverName / load.driverId) — check there first, then
@@ -114,10 +119,10 @@ async function resolveDriver(rawPro) {
           firstVal(lexe, ["driverId", "driver.driverId", "driver.id"]);
       }
     }
-    return { driver: driver || "", driverId: driverId || "" };
+    return { driver: driver || "", driverId: driverId || "", wrap: stopData };
   } catch (err) {
     console.log("resolveDriver error (non-fatal):", err.message);
-    return { driver: "", driverId: "" };
+    return { driver: "", driverId: "", wrap: null };
   }
 }
 
@@ -128,6 +133,10 @@ const {
   GOOGLE_REVIEW_URL, reviewsStore, clicksStore, normalizeSource, SOURCE_LABEL,
   trackedGoogleUrl, cleanRef, withClicks,
 } = require("./lib/reviews");
+
+const {
+  extractCustomer, extractPodDocs, selectPhotos, customerBlockHtml, photosBlockHtml, esc,
+} = require("./lib/stop-context");
 
 exports.handler = async (event) => {
   const headers = {
@@ -302,7 +311,7 @@ exports.handler = async (event) => {
   const proClean = (proNumber || "").trim().slice(0, 50);
 
   // Resolve the delivering driver up front so every reader is attributed.
-  const { driver, driverId } = await resolveDriver(proClean);
+  const { driver, driverId, wrap } = await resolveDriver(proClean);
 
   const review = {
     id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
@@ -343,6 +352,23 @@ exports.handler = async (event) => {
     console.error("Blob storage error:", err);
   }
 
+  // WHO IT WAS FOR, AND WHAT THE DRIVER PHOTOGRAPHED. Chad: "these emails ... i want to start
+  // to include the customers information and the photos of the delivery."
+  //
+  // NO I/O HAPPENS HERE. Both blocks are pure reads of the /stop/info response resolveDriver
+  // already fetched, so the whole enrichment costs ZERO additional NuVizz calls and adds no
+  // measurable time to the customer's rating POST.
+  //
+  // The first version of this downloaded the photo bytes here and attached them. That put six
+  // sequential multi-megabyte downloads on the customer's critical path (measured at 9-19s
+  // against a stubbed document server, against a Netlify ceiling well under it), could wedge
+  // the handler before the alert was ever sent, and turned a public unauthenticated POST into
+  // up to ~40 metered NuVizz calls. The photos are LINKED instead — see lib/stop-context.
+  const customer = wrap ? extractCustomer(wrap) : null;
+  const { photos, otherDocs } = selectPhotos(extractPodDocs(wrap));
+  const customerHtml = customerBlockHtml(customer, { pro: proClean });
+  const photosHtml = photosBlockHtml({ photos, otherDocs, pro: proClean, resolved: !!wrap });
+
   // Email if rating is 3 or below
   if (rating <= 3 && RESEND_API_KEY) {
     try {
@@ -367,9 +393,11 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">${"★".repeat(rating)}<span style="color:#dde2e8">${"★".repeat(5 - rating)}</span></div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Name:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${esc(review.name) || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${esc(review.contact) || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#fef5f5;padding:16px;border-left:4px solid #d63b3b;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                ${customerHtml}
+                ${photosHtml}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">🔒 This review was captured internally and was NOT sent to Google.</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">📊 <a href="https://davisdeliverytracking.netlify.app/admin" style="color:#1e5b92">View full dashboard</a></p>
@@ -417,9 +445,11 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">★★★★★</div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Name:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${esc(review.name) || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${esc(review.contact) || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                ${customerHtml}
+                ${photosHtml}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">🔗 They were handed the Google review link. Whether they actually took it shows on the dashboard — this email is sent the moment they hit Send, so at this instant nobody knows yet.</p>
                 <p style="color:#666;font-size:12px;margin:4px 0">📍 Came from: <strong>${SOURCE_LABEL[review.source] || review.source}</strong></p>
