@@ -135,95 +135,8 @@ const {
 } = require("./lib/reviews");
 
 const {
-  extractCustomer, extractPodDocs, selectPhotos, fitWithinBudget,
-  attachmentName, customerBlockHtml, photosBlockHtml,
+  extractCustomer, extractPodDocs, selectPhotos, customerBlockHtml, photosBlockHtml, esc,
 } = require("./lib/stop-context");
-
-// Proof-of-delivery image bytes come from the deliverIt *documentapi*, NOT the v7 OpenAPI
-// this file otherwise talks to. Mirrors dispatch-map/netlify/functions/nuvizz-pod.mts, which
-// is the proven implementation: company order [ULINE, DAVIS] (Uline docs sometimes resolve
-// under DAVIS; a 404 means wrong company, try the next), across both hosts.
-const DOC_BASE = process.env.NUVIZZ_DOC_BASE || "https://portal.nuvizz.com/deliverit/openapi/documentapi";
-const DOC_FAILOVER = (u) => u.replace("portal.nuvizz.com", "contact-support.nuvizz.com");
-
-function docAuthHeader() {
-  const u = process.env.NUVIZZ_DOC_USER, p = process.env.NUVIZZ_DOC_PASS;
-  if (u && p) return "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
-  if (ULINE_PASS) return "Basic " + Buffer.from(`${ULINE_USER}:${ULINE_PASS}`).toString("base64");
-  return "Basic " + Buffer.from(`${DAVIS_USER}:${DAVIS_PASS || ""}`).toString("base64");
-}
-
-// One document's base64 bytes, or null. NEVER THROWS — a photo that will not load must cost
-// the alert nothing. The email says how many are missing rather than failing to arrive.
-async function fetchDocBase64(doc) {
-  let guid = doc.documentGuid || "";
-  let ext = (doc.extension || "").toLowerCase();
-  let cc = "";
-  if (!guid && doc.documentPath) {
-    const sp = new URLSearchParams(doc.documentPath.startsWith("?") ? doc.documentPath.slice(1) : doc.documentPath);
-    guid = sp.get("docGuid") || sp.get("documentGuid") || "";
-    ext = ext || (sp.get("ext") || sp.get("extension") || "").toLowerCase();
-    cc = sp.get("cc") || "";
-  }
-  if (!guid) return null;
-  ext = ext || "jpg";
-  const auth = docAuthHeader();
-  const companies = [...new Set([cc, "ULINE", "DAVIS"].filter(Boolean).map((s) => s.toUpperCase()))];
-  for (const base of [DOC_BASE, DOC_FAILOVER(DOC_BASE)]) {
-    for (const company of companies) {
-      try {
-        const target = `${base}/doc/getdocument/${encodeURIComponent(company)}`
-          + `?documentGuid=${encodeURIComponent(guid)}&objectType=02&extension=${encodeURIComponent(ext)}`;
-        const r = await fetch(target, { headers: { Authorization: auth, Accept: "application/json" } });
-        if (!r.ok) continue;
-        const j = await r.json();
-        const b64 = j && (j.documentData || j.documentdata);
-        if (typeof b64 === "string" && b64) {
-          // base64 inflates by 4/3; the real payload size is what the budget cares about.
-          return { base64: b64, bytes: Math.floor(b64.length * 0.75) };
-        }
-      } catch { /* next company / host */ }
-    }
-  }
-  return null;
-}
-
-/**
- * The delivery photos for a stop, as Resend attachments, plus an honest count of what did
- * not make it. Costs one documentapi call PER PHOTO (capped at MAX_PHOTOS) — the customer
- * block above it costs none, since it reads the stop response resolveDriver already fetched.
- *
- * Best-effort throughout: any failure yields fewer photos, never a lost review or alert.
- */
-async function collectDeliveryPhotos(wrap, pro) {
-  const empty = { attachments: [], block: { attached: [], missing: 0, otherDocs: [] } };
-  if (!wrap) return empty;
-  try {
-    const docs = extractPodDocs(wrap);
-    if (!docs.length) return empty;
-    const { photos, skippedPhotos, otherDocs } = selectPhotos(docs);
-    const fetched = [];
-    for (let i = 0; i < photos.length; i++) {
-      const got = await fetchDocBase64(photos[i]);
-      if (got) fetched.push({ ...got, filename: attachmentName(pro, i, photos[i]), createdTime: photos[i].createdTime });
-    }
-    const { kept, dropped } = fitWithinBudget(fetched);
-    return {
-      attachments: kept.map((k) => ({ filename: k.filename, content: k.base64 })),
-      block: {
-        attached: kept.map((k) => ({ filename: k.filename, createdTime: k.createdTime })),
-        // Everything the owner is NOT looking at: over the cap, over the byte ceiling, or
-        // simply would not fetch. Counted together because the action is the same — open
-        // the dashboard — and three separate numbers would be noise in an alert.
-        missing: skippedPhotos.length + dropped.length + (photos.length - fetched.length),
-        otherDocs,
-      },
-    };
-  } catch (err) {
-    console.log("collectDeliveryPhotos error (non-fatal):", err.message);
-    return empty;
-  }
-}
 
 exports.handler = async (event) => {
   const headers = {
@@ -442,26 +355,19 @@ exports.handler = async (event) => {
   // WHO IT WAS FOR, AND WHAT THE DRIVER PHOTOGRAPHED. Chad: "these emails ... i want to start
   // to include the customers information and the photos of the delivery."
   //
-  // DELIBERATELY AFTER THE BLOB WRITE, and that ordering is the whole safety of this feature.
-  // Fetching photos means up to six sequential multi-megabyte downloads from the NuVizz
-  // document API. Netlify gives a synchronous function a hard execution ceiling, and this
-  // handler's FIRST duty is not losing what the customer typed. Run the enrichment before the
-  // write and a slow document server does not merely cost the photos — it costs the review
-  // itself, silently, on the endpoint whose entire job is to capture it. The alert can degrade
-  // to no photos; the review may not degrade to nothing.
+  // NO I/O HAPPENS HERE. Both blocks are pure reads of the /stop/info response resolveDriver
+  // already fetched, so the whole enrichment costs ZERO additional NuVizz calls and adds no
+  // measurable time to the customer's rating POST.
   //
-  // The customer block is a pure read of the response resolveDriver already fetched, so it
-  // adds no NuVizz calls. Only the photo BYTES cost anything, one documentapi call each,
-  // capped in lib/stop-context.
-  //
-  // Only fetched when an alert is actually going out. A 4-star routes straight to Google with
-  // no email, and paying for photos nobody will look at is how a per-review cost turns into
-  // a bill.
-  const willAlert = !!RESEND_API_KEY && (rating <= 3 || rating === 5);
+  // The first version of this downloaded the photo bytes here and attached them. That put six
+  // sequential multi-megabyte downloads on the customer's critical path (measured at 9-19s
+  // against a stubbed document server, against a Netlify ceiling well under it), could wedge
+  // the handler before the alert was ever sent, and turned a public unauthenticated POST into
+  // up to ~40 metered NuVizz calls. The photos are LINKED instead — see lib/stop-context.
   const customer = wrap ? extractCustomer(wrap) : null;
-  const photos = willAlert ? await collectDeliveryPhotos(wrap, proClean) : { attachments: [], block: {} };
-  const customerHtml = customerBlockHtml(customer);
-  const photosHtml = photosBlockHtml(photos.block);
+  const { photos, otherDocs } = selectPhotos(extractPodDocs(wrap));
+  const customerHtml = customerBlockHtml(customer, { pro: proClean });
+  const photosHtml = photosBlockHtml({ photos, otherDocs, pro: proClean, resolved: !!wrap });
 
   // Email if rating is 3 or below
   if (rating <= 3 && RESEND_API_KEY) {
@@ -477,7 +383,6 @@ exports.handler = async (event) => {
           to: REVIEW_EMAIL,
           reply_to: REVIEW_EMAIL,
           subject: `⚠️ ${rating}-Star Review — PRO# ${review.proNumber || "Unknown"}`,
-          ...(photos.attachments.length ? { attachments: photos.attachments } : {}),
           html: `
             <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;padding:20px">
               <div style="background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:20px;border-radius:8px;margin-bottom:16px">
@@ -488,8 +393,8 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">${"★".repeat(rating)}<span style="color:#dde2e8">${"★".repeat(5 - rating)}</span></div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Review left by:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Their contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${esc(review.name) || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${esc(review.contact) || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#fef5f5;padding:16px;border-left:4px solid #d63b3b;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
                 ${customerHtml}
                 ${photosHtml}
@@ -530,7 +435,6 @@ exports.handler = async (event) => {
           to: REVIEW_EMAIL,
           reply_to: REVIEW_EMAIL,
           subject: `⭐ 5-Star Review — PRO# ${review.proNumber || "Unknown"}`,
-          ...(photos.attachments.length ? { attachments: photos.attachments } : {}),
           html: `
             <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;padding:20px">
               <div style="background:linear-gradient(135deg,#0a2744,#1e5b92);color:#fff;padding:20px;border-radius:8px;margin-bottom:16px">
@@ -541,8 +445,8 @@ exports.handler = async (event) => {
                 <div style="font-size:28px;color:#e8a838;letter-spacing:3px;margin-bottom:12px">★★★★★</div>
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
-                <p style="margin:6px 0"><strong>Review left by:</strong> ${review.name || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Their contact:</strong> ${review.contact || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Review left by:</strong> ${esc(review.name) || "Anonymous"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${esc(review.contact) || "Not provided"}</p>
                 ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
                 ${customerHtml}
                 ${photosHtml}

@@ -18,9 +18,10 @@
 // THE CALL BUDGET, WHICH IS WHY THIS FILE IS SHAPED THIS WAY. review.js already fetches
 // /stop/info/{pro}/DAVIS on every submission to attribute the driver, and then throws the rest
 // of the response away. The customer block AND the photo references are both already in that
-// payload. So everything here is a PURE READ of a response we have already paid for: adding
-// the customer costs ZERO additional NuVizz calls. Only the photo BYTES cost anything, one
-// documentapi call each, capped and counted below.
+// payload. So EVERYTHING here is a PURE READ of a response we have already paid for — the
+// customer block and the photo counts alike cost ZERO additional NuVizz calls, and nothing in
+// this file performs any I/O at all. See the note above photosBlockHtml for why the image
+// bytes are linked rather than fetched.
 //
 // Field paths mirror dispatch-map/netlify/functions/lib/nuvizz-scan.mts (normalizeStop). They
 // are duplicated rather than shared because these are two separate repos and two separate
@@ -120,6 +121,12 @@ function extractPodDocs(wrap) {
       documentPath: d.documentPath || null,
       // Capture docs key the extension as documentExtType ("JPG"); POD docs use extension.
       extension: (d.extension || d.documentExtType || null),
+      // THE FIELD THAT ACTUALLY SAYS WHAT A DOCUMENT IS. "02" is a driver's delivery photo,
+      // "03" is the signed POD. This repo's own customer-facing tracker has always keyed off
+      // it (public/index.html: docs.find(x => x.documentType === "03") for the POD,
+      // docs.filter(x => x.documentType === "02") for the photos). Classifying by file
+      // extension instead counts the signed POD as a delivery photo, because it is a .jpg too.
+      documentType: d.documentType || null,
       createdTime: d.createdTime || d.createdDTTM || null,
     };
     if (!(doc.documentGuid || doc.documentPath || doc.documentName)) continue;
@@ -133,65 +140,65 @@ function extractPodDocs(wrap) {
 }
 
 const PHOTO_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic']);
+const TYPE_DELIVERY_PHOTO = '02';
+const TYPE_SIGNED_POD = '03';
 
-// A signed BOL PDF is a document, not a photo of the delivery. It still gets NAMED in the
-// email — "there is paperwork here" is worth knowing — but it is not what Chad asked to see
-// and it is not worth spending a fetch on.
+// A signed POD is a document, not a photo of the delivery. Both are .jpg, so the EXTENSION
+// cannot tell them apart — documentType can, and the live tracker in this repo already uses
+// it that way. Extension is only the fallback for entries that carry no type at all (podDoc
+// bundle entries may not).
 function isPhotoDoc(doc) {
-  return !!doc && PHOTO_EXTS.has(String(doc.extension || '').toLowerCase());
+  if (!doc) return false;
+  const t = doc.documentType == null ? '' : String(doc.documentType).trim();
+  if (t === TYPE_DELIVERY_PHOTO) return true;
+  if (t === TYPE_SIGNED_POD) return false;
+  return PHOTO_EXTS.has(String(doc.extension || '').toLowerCase());
 }
 
-// HOW MANY PHOTOS TRAVEL, AND WHY THERE IS A CAP AT ALL.
+// WHY THE PHOTOS ARE LINKED AND NOT SHIPPED.
 //
-// Each photo is one metered documentapi call and rides along as an email attachment. A phone
-// camera capture runs 1-3MB, so an 8-photo delivery is ~20MB before base64 — past what is
-// sensible to push through Resend on every low rating, and slow to open on a phone.
+// The first version of this fetched the image bytes at submit time and attached them to the
+// alert. An adversarial read of it, with the timings actually measured against a stubbed
+// document server, killed that design outright:
 //
-// Six is chosen against the real failure: a delivery gone wrong that the driver documented
-// heavily. Six photos is enough to see the door, the freight and the paperwork; beyond that
-// the extra frames are duplicates of the same pallet. Whatever is left over is NAMED in the
-// email rather than silently dropped — a cap nobody is told about reads as "this is all of
-// them", which is exactly the kind of confident wrong sentence this repo has shipped before.
-const MAX_PHOTOS = 6;
-const MAX_PHOTO_BYTES = 15 * 1024 * 1024;
+//   * It sat on the CUSTOMER'S critical path. review.js answers the rating POST only after the
+//     enrichment finishes; six photos measured 9-19 seconds. Netlify kills a synchronous
+//     function well before that, and public/review.html turns the resulting 502 into
+//     "Something went wrong. Please try again." — shown to the angriest customer we have,
+//     whose complaint we most need to keep.
+//   * THE DEGRADED PATH WAS THE SLOWEST PATH. With the host/company failover, a stop whose
+//     documents never resolve costs 24 sequential round trips and ~19s to produce an email
+//     with no photos in it. "It just degrades to no photos" was the opposite of true.
+//   * It could lose the ALERT. A hanging document host wedges the handler before the Resend
+//     call is ever reached, so a 1-star review is stored and nobody is ever told — and a
+//     platform kill is not a throw, so the best-effort catch never runs and nothing logs it.
+//   * It turned a PUBLIC, unauthenticated, CORS-open POST into up to ~40 metered NuVizz calls
+//     per request. Against a vendor API this repo's owner meters carefully, that is an abuse
+//     amplifier, and a customer retrying after the 502 above pays it again.
+//
+// So: DO NOT FETCH. The document references are already in the /stop/info response
+// resolveDriver paid for, which means the alert can say how many photos exist and what they
+// are for ZERO calls and zero added latency — and then link to the tracking page for that PRO,
+// where public/index.html ALREADY renders a working photo viewer with a download-all. Chad is
+// one tap from the pictures instead of scrolling an attachment list, the alert is instant, and
+// a document-server outage cannot touch either the review or the email.
+//
+// The bytes are fetched exactly when somebody looks at them, which is the cost-correct shape.
+const TRACKING_ORIGIN = 'https://tracking.davisdelivery.com/';
 
-/**
- * Split the document list into what travels and what only gets named.
- * Returns { photos, skippedPhotos, otherDocs } — `skippedPhotos` is the honest overflow.
- */
-function selectPhotos(docs, max = MAX_PHOTOS) {
+/** The tracker deep-link for a PRO — public/index.html auto-loads from ?pro=. */
+function trackingUrl(pro, origin = TRACKING_ORIGIN) {
+  const p = String(pro == null ? '' : pro).trim();
+  return p ? `${origin}?pro=${encodeURIComponent(p)}` : origin;
+}
+
+/** Split a stop's documents into the delivery photos and everything else (POD, BOL, ...). */
+function selectPhotos(docs) {
   const all = Array.isArray(docs) ? docs : [];
-  const photos = all.filter(isPhotoDoc);
   return {
-    photos: photos.slice(0, max),
-    skippedPhotos: photos.slice(max),
-    otherDocs: all.filter((d) => !isPhotoDoc(d)),
+    photos: all.filter(isPhotoDoc),
+    otherDocs: all.filter((d) => d && !isPhotoDoc(d)),
   };
-}
-
-/**
- * Stop adding attachments once the running total would pass the byte ceiling. Returns the
- * ones that fit plus the ones that did not, so the email can say so.
- */
-function fitWithinBudget(fetched, maxBytes = MAX_PHOTO_BYTES) {
-  const kept = [];
-  const dropped = [];
-  let total = 0;
-  for (const f of fetched || []) {
-    const size = f && f.bytes ? f.bytes : 0;
-    if (!f || !f.base64) { dropped.push(f); continue; }
-    if (total + size > maxBytes) { dropped.push(f); continue; }
-    total += size;
-    kept.push(f);
-  }
-  return { kept, dropped, totalBytes: total };
-}
-
-/** A stable, human filename for an attachment: PRO + index + real extension. */
-function attachmentName(pro, i, doc) {
-  const ext = (doc && doc.extension) || 'jpg';
-  const base = String(pro || 'delivery').replace(/[^A-Za-z0-9_-]+/g, '') || 'delivery';
-  return `${base}-photo-${i + 1}.${ext}`;
 }
 
 // ── EMAIL BLOCKS ─────────────────────────────────────────────────────────────
@@ -205,13 +212,20 @@ const LABEL = 'color:#667;font-size:11px;text-transform:uppercase;letter-spacing
  * can act from the alert instead of navigating to the dashboard first, and on a phone a
  * tel: link is one tap.
  */
-function customerBlockHtml(customer) {
+function customerBlockHtml(customer, { pro = '', origin } = {}) {
   if (!customer || !customer.present) {
     // Saying nothing would read as "this stop has no customer", which is never true. Naming
     // the miss is what tells somebody the lookup failed rather than the data being empty.
+    //
+    // And it points at the TRACKING page, not the admin dashboard. public/admin.html renders
+    // the review record only — rating, reviewer, comment, PRO, driver, source. It has never
+    // shown a customer or a photo, so sending him there to "look it up" sent him somewhere
+    // that could not answer.
+    const link = pro ? `<div style="margin-top:8px"><a href="${esc(trackingUrl(pro, origin))}" style="color:#1e5b92;font-size:12px">Open the tracking page</a></div>` : '';
     return `<div style="background:#f7f8fa;padding:14px;border-radius:6px;margin:16px 0">
       <div style="${LABEL}">Customer</div>
-      <div style="color:#667;font-size:13px;margin-top:4px">Couldn't be resolved from the PRO — look it up on the dashboard.</div>
+      <div style="color:#667;font-size:13px;margin-top:4px">Couldn't be resolved from the PRO.</div>
+      ${link}
     </div>`;
   }
   const addr = formatAddress(customer);
@@ -230,32 +244,47 @@ function customerBlockHtml(customer) {
 }
 
 /**
- * WHAT THE DRIVER LEFT. The photos ride as attachments rather than inline base64: Gmail clips
- * an HTML body past roughly 102KB and hides everything after the cut — which would include
- * the dashboard link — while an image attachment previews in the client anyway, on a phone as
- * well as a desktop. So this block is the caption, and the pictures come with it.
+ * WHAT THE DRIVER LEFT. A count and a way to see them — never a claim about bytes we did not
+ * move. The counts come from the stop response resolveDriver already fetched, so this block
+ * costs nothing and cannot fail.
  *
- * `attached` are the ones that made it; `missing` covers a fetch that failed, the per-email
- * cap and the byte ceiling. All three are stated, because "3 photos" printed over a delivery
- * that had eight is the sentence that gets believed.
+ * The wording is deliberately exact. An earlier draft could print "No delivery photos were
+ * available for this PRO" and "4 more photos were not attached" in the same block, because the
+ * empty branch tested only whether any bytes had arrived. The first sentence was false, and it
+ * is the one a reader believes. There is no such ambiguity here: either the stop has photos or
+ * it does not, and that is a fact read straight off the payload.
  */
-function photosBlockHtml({ attached = [], missing = 0, otherDocs = [] } = {}) {
-  const parts = [`<div style="${LABEL}">Delivery photos</div>`];
-  if (attached.length) {
-    parts.push(`<div style="font-size:13px;color:#445;margin-top:4px">${attached.length} photo${attached.length === 1 ? '' : 's'} attached to this email.</div>`);
-    const names = attached.map((a) => {
-      const when = a.createdTime ? ` <span style="color:#889">${esc(a.createdTime)}</span>` : '';
-      return `<li style="margin:2px 0">${esc(a.filename)}${when}</li>`;
-    }).join('');
-    parts.push(`<ul style="font-size:12px;color:#667;margin:6px 0 0;padding-left:18px">${names}</ul>`);
-  } else {
-    parts.push(`<div style="font-size:13px;color:#445;margin-top:4px">No delivery photos were available for this PRO.</div>`);
+function photosBlockHtml({ photos = [], otherDocs = [], pro = '', origin, resolved = true } = {}) {
+  const n = photos.length;
+  // WE ONLY GET TO SAY "NONE" IF WE ACTUALLY LOOKED. When the PRO lookup fails, wrap is null
+  // and extractPodDocs returns [] — indistinguishable, at this layer, from a stop the driver
+  // photographed nothing on. Printing "the driver captured no delivery photos" there states as
+  // fact something never observed, about a driver, on a complaint email. It is the same defect
+  // the empty-vs-missing branch had, wearing different clothes.
+  if (!resolved) {
+    return `<div style="background:#f7f8fa;padding:14px;border-radius:6px;margin:16px 0">`
+      + `<div style="${LABEL}">Delivery photos</div>`
+      + `<div style="font-size:13px;color:#667;margin-top:4px">Couldn't be checked — the PRO didn't resolve.</div>`
+      + (pro ? `<div style="margin-top:8px"><a href="${esc(trackingUrl(pro, origin))}" style="color:#1e5b92;font-size:12px">Open the tracking page</a></div>` : '')
+      + `</div>`;
   }
-  if (missing > 0) {
-    parts.push(`<div style="font-size:12px;color:#a15c00;margin-top:6px">${missing} more photo${missing === 1 ? '' : 's'} on this stop ${missing === 1 ? 'was' : 'were'} not attached — see the dashboard.</div>`);
+  const link = trackingUrl(pro, origin);
+  const parts = [`<div style="${LABEL}">Delivery photos</div>`];
+  if (n) {
+    parts.push(`<div style="font-size:13px;color:#445;margin-top:4px">${n} photo${n === 1 ? '' : 's'} on this delivery.</div>`);
+    const stamps = photos.map((p) => p.createdTime).filter(Boolean);
+    if (stamps.length) {
+      parts.push(`<div style="font-size:12px;color:#667;margin-top:3px">Taken ${esc(stamps[0])}${stamps.length > 1 ? ` – ${esc(stamps[stamps.length - 1])}` : ''}</div>`);
+    }
+    parts.push(`<div style="margin-top:9px"><a href="${esc(link)}" style="display:inline-block;background:#1e5b92;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:9px 16px;border-radius:6px">View the ${n === 1 ? 'photo' : `${n} photos`}</a></div>`);
+  } else {
+    // "None on this stop" is a real answer and a useful one — it says the driver captured
+    // nothing, which is itself worth knowing on a complaint about where freight was left.
+    parts.push(`<div style="font-size:13px;color:#445;margin-top:4px">The driver captured no delivery photos on this stop.</div>`);
+    if (pro) parts.push(`<div style="margin-top:8px"><a href="${esc(link)}" style="color:#1e5b92;font-size:12px">Open the tracking page</a></div>`);
   }
   if (otherDocs.length) {
-    parts.push(`<div style="font-size:12px;color:#667;margin-top:6px">Also on file: ${otherDocs.map((d) => esc(d.documentName || d.extension || 'document')).join(', ')}</div>`);
+    parts.push(`<div style="font-size:12px;color:#667;margin-top:8px">Also on file: ${otherDocs.map((d) => esc(d.documentName || d.extension || 'document')).join(', ')}</div>`);
   }
   return `<div style="background:#f7f8fa;padding:14px;border-radius:6px;margin:16px 0">${parts.join('')}</div>`;
 }
@@ -267,11 +296,9 @@ module.exports = {
   extractPodDocs,
   isPhotoDoc,
   selectPhotos,
-  fitWithinBudget,
-  attachmentName,
+  trackingUrl,
   customerBlockHtml,
   photosBlockHtml,
-  MAX_PHOTOS,
-  MAX_PHOTO_BYTES,
   PHOTO_EXTS,
+  TRACKING_ORIGIN,
 };
