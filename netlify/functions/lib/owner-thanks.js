@@ -75,10 +75,13 @@ function firstName(full) {
 }
 
 /** The note itself, as plain text. Plain because a mailto body cannot be anything else. */
-function thanksBody({ name, driver, googleUrl }) {
-  // Their name is used EXACTLY as they typed it, not re-cased — same as the follow-up mailer
-  // does. Someone who signs "TOB" gets "Hi TOB"; title-casing it to "Tob" invents a person.
-  const hi = name ? `Hi ${name},` : "Hi there,";
+function thanksBody({ driver, googleUrl }) {
+  // JUST "Hi". Chad: "take out trying to name who just write hi." The name field on the review
+  // form is whatever the customer typed, and it is often not a person — the five-star review
+  // this was built from was signed "TOB", the company's initials. "Hi TOB," in a note the
+  // owner is about to sign himself reads like a mail-merge that misfired, which is the one
+  // thing this note is supposed not to be. A bare "Hi," is right every single time.
+  const hi = "Hi,";
   const about = driver
     ? `Thank you for the kind words about ${driver} — I passed them straight on to him.`
     : `Thank you for taking the time to rate your delivery — it genuinely made someone's day here.`;
@@ -95,7 +98,7 @@ function thanksBody({ name, driver, googleUrl }) {
     "",
     "We're family-owned, and reviews are how new customers find us. Thank you either way.",
     "",
-    "Chad Blyth",
+    "Chad Davis",
     "Davis Delivery Service",
   ].join("\n");
 }
@@ -114,16 +117,19 @@ function ownerThanksMailto({ review, googleUrl } = {}) {
   const link = String(googleUrl == null ? "" : googleUrl).trim();
   if (!link) return null;                       // a thank-you with no link is not this feature
 
-  // CLAMPED, because these are free-text fields a stranger filled in. The first build let
-  // them through at full length and relied on the over-cap fallback below to save it — but
-  // that fallback greets them by name too, so a 4,000-character "name" blew straight through
-  // both and produced an href no mail client would open. Caught by the length test, which is
-  // the only reason this comment is here rather than a bug in Chad's inbox. Sixty characters
-  // is longer than any real name and shorter than anything that could crowd out the link.
-  const name = String(r.name == null ? "" : r.name).trim().slice(0, 60);
+  // CLAMPED. The driver name is now the ONLY free text that reaches the note — the customer's
+  // own name no longer appears anywhere in it — and it still arrives from a vendor lookup
+  // rather than from us.
+  //
+  // WHAT THIS CLAMP ACTUALLY DOES, measured rather than assumed: it keeps the NORMAL note
+  // readable. It is NOT what stops an absurd value producing an unopenable href — the over-cap
+  // fallback below does that, and it does it whether or not this line exists. That was checked
+  // by deleting the clamp and running it: the note falls back and the link survives. The
+  // difference the clamp makes is that a 4,000-character driver name still yields the real
+  // note instead of silently demoting every such delivery to the stripped one.
   const driver = firstName(r.driver).slice(0, 40);
   const subject = "Thank you from Davis Delivery";
-  const body = thanksBody({ name, driver, googleUrl: link });
+  const body = thanksBody({ driver, googleUrl: link });
 
   const href = `mailto:${encodeURIComponent(to)}`
     + `?subject=${encodeURIComponent(subject)}`
@@ -131,7 +137,7 @@ function ownerThanksMailto({ review, googleUrl } = {}) {
   // Over the cap, drop the pleasantries rather than the link: a note that arrives without its
   // Google URL is the one outcome this whole thing exists to prevent.
   if (href.length > MAILTO_MAX) {
-    const short = [name ? `Hi ${name},` : "Hi there,", "", "Thank you for the review — it means a lot.", "", "It looks like it didn't make it through to Google. If you still have a minute, this goes straight there:", "", link, "", "Chad Blyth", "Davis Delivery Service"].join("\n");
+    const short = ["Hi,", "", "Thank you for the review — it means a lot.", "", "It looks like it didn't make it through to Google. If you still have a minute, this goes straight there:", "", link, "", "Chad Davis", "Davis Delivery Service"].join("\n");
     const shortHref = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(short)}`;
     return { to, subject, body: short, href: shortHref };
   }

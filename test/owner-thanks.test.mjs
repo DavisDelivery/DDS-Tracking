@@ -99,10 +99,22 @@ test('an unattributed delivery still gets a note, just not one about a driver', 
   assert.ok(t.body.includes(LINK));
 });
 
-test('the reviewer is greeted with what they actually typed', () => {
-  // "TOB" is how they signed it. Title-casing it to "Tob" invents a person who is not there.
-  assert.match(ownerThanksMailto({ review: review({ name: 'TOB' }), googleUrl: LINK }).body, /^Hi TOB,/);
-  assert.match(ownerThanksMailto({ review: review({ name: '' }), googleUrl: LINK }).body, /^Hi there,/);
+test('the note opens with a bare "Hi," and never tries to name them', () => {
+  // Chad: "take out trying to name who just write hi." The name field is whatever the customer
+  // typed and is often not a person — the review this was built from was signed "TOB", the
+  // company's initials. "Hi TOB," in a note the owner signs himself reads as a misfired
+  // mail-merge, which is the one thing this note must not be.
+  for (const name of ['TOB', 'Rukhsana', '', 'receiving', 'x'.repeat(200)]) {
+    const b = ownerThanksMailto({ review: review({ name }), googleUrl: LINK }).body;
+    assert.match(b, /^Hi,\n/, `for ${JSON.stringify(name)}`);
+    if (name) assert.ok(!b.includes(name), 'their name must not appear anywhere in the note');
+  }
+});
+
+test('the note is signed Chad Davis', () => {
+  const b = ownerThanksMailto({ review: review(), googleUrl: LINK }).body;
+  assert.match(b, /Chad Davis/);
+  assert.ok(!/Chad Blyth/.test(b));
 });
 
 // ── Encoding ─────────────────────────────────────────────────────────────────
@@ -118,16 +130,35 @@ test('newlines reach the compose window as newlines', () => {
   assert.ok(t.href.includes('%0A'), 'a body without encoded newlines arrives as one run-on paragraph');
 });
 
-test('a hostile name cannot inject markup or extra mailto parameters', () => {
-  const t = ownerThanksMailto({ review: review({ name: '"><b>x</b> &cc=someone@else.com' }), googleUrl: LINK });
+test('hostile text in the DRIVER field cannot inject markup or extra mailto parameters', () => {
+  // Aimed at the driver, not the customer's name: the name no longer reaches the note at all,
+  // so asserting against it would be a test that passes because there is nothing to attack.
+  // The driver arrives from a vendor lookup and is the only free text left in the body.
+  const t = ownerThanksMailto({ review: review({ driver: '"><b>x</b> &cc=someone@else.com' }), googleUrl: LINK });
   const attr = mailtoAttr(t.href);
-  assert.ok(!attr.includes('<b>'));
+  assert.ok(attr.includes(encodeURIComponent('<b>')) === false || !attr.includes('<b>'));
+  assert.ok(!/<b>/.test(attr));
   assert.ok(!/&cc=/.test(attr), 'an unencoded & in the body would become a real mailto header');
 });
 
 // ── Length ───────────────────────────────────────────────────────────────────
-test('a very long name drops the pleasantries but never the Google link', () => {
-  const t = ownerThanksMailto({ review: review({ name: 'x'.repeat(4000) }), googleUrl: LINK });
+test('an absurd DRIVER name cannot push the Google link out of the note', () => {
+  // Aimed at the driver: the customer's name is gone from the body, so a long one proves
+  // nothing. What holds HERE is the over-cap fallback, not the clamp — verified by deleting
+  // the clamp and re-running, which still passes this.
+  const t = ownerThanksMailto({ review: review({ driver: 'x'.repeat(4000) }), googleUrl: LINK });
   assert.ok(t.href.length <= MAILTO_MAX, `href was ${t.href.length}`);
   assert.ok(t.body.includes(LINK), 'a truncated note that loses the link defeats the whole feature');
+});
+
+test('an absurd driver name still yields the REAL note, not the stripped fallback', () => {
+  // This is the clamp's actual job, and without this test nothing in the suite held it: the
+  // length test above passes either way because the fallback catches the overflow. Without the
+  // clamp every such delivery is silently demoted to the short note — link intact, but the
+  // thank-you and the apology gone.
+  const t = ownerThanksMailto({ review: review({ driver: 'x'.repeat(4000) }), googleUrl: LINK });
+  assert.match(t.body, /kind words about/, 'the real note, not the fallback');
+  assert.match(t.body, /I'm sorry/, 'the apology survives too');
+  const shown = (t.body.match(/kind words about (x+)/) || [])[1] || '';
+  assert.ok(shown.length <= 40, `driver ran to ${shown.length} chars in the note`);
 });
