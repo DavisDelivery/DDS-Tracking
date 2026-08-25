@@ -136,10 +136,6 @@ const {
 
 const { ownerThanksMailto, mailtoAttr } = require("./lib/owner-thanks");
 
-// Same variable, same default as lib/followup-core — there is one tracking origin and a
-// second opinion about it here would send half the click hops to a host that is not serving.
-const SITE_ORIGIN = (process.env.REVIEW_SITE_ORIGIN || "https://tracking.davisdelivery.com").replace(/\/+$/, "");
-
 const {
   extractCustomer, extractPodDocs, selectPhotos, customerBlockHtml, photosBlockHtml, esc,
 } = require("./lib/stop-context");
@@ -431,13 +427,14 @@ exports.handler = async (event) => {
   //
   // THE OWNER'S THANK-YOU, prepared but not sent. Chad asked to be able to tap the customer's
   // address in this alert and have a thank-you with the Google link already written — sent
-  // from his own mailbox, so it reads like a person rather than a second robot. The link
-  // inside it is the TRACKED hop, not g.page: see lib/owner-thanks for why that is what stops
-  // the automatic follow-up mailing somebody he has already asked.
-  const thanks = ownerThanksMailto({
-    review,
-    googleUrl: trackedGoogleUrl(review.clickRef || review.id, SITE_ORIGIN, "owner-thanks"),
-  });
+  // from his own mailbox, so it reads like a person rather than a second robot.
+  //
+  // GOOGLE'S OWN URL, not the tracked /g hop. Chad: "i want it to have a link straight to
+  // google ... i don't want to link them back to my page." In a plain-text note there is no
+  // anchor text to hide a URL behind, so the customer reads whichever one we put there. The
+  // cost — this click cannot stamp googleClickAt, so the automatic follow-up may still nudge
+  // someone he has written to personally — is spelled out in lib/owner-thanks.
+  const thanks = ownerThanksMailto({ review, googleUrl: GOOGLE_REVIEW_URL });
   // No address to write to (the field also collects phone numbers) → the contact stays plain
   // text and no button appears. A mailto: to a phone number opens a compose window that looks
   // fine and goes nowhere, which is worse than no link at all.

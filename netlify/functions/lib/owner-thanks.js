@@ -15,15 +15,34 @@
 // It also keeps this entirely outside the sending domain, the daily cap and the suppression
 // list, because a one-to-one message a person types and sends is not a mailing.
 //
-// ── WHY THE TRACKED LINK AND NOT g.page DIRECTLY ────────────────────────────
-// This repo already mails a 4-5★ customer a nudge when the click hop never saw them
-// (lib/followup-core), and REVIEW_FOLLOWUP_ENABLED defaults to ON. Put the raw g.page URL in
-// Chad's note and a customer who takes it is still invisible to that job — so the robot
-// writes to somebody Chad has already asked personally, saying "this is the only time we'll
-// ask", which by then is false. Routing his ask through the same /g hop means a click stamps
-// the record, followupEligible sees googleClickAt and stands down, and the two never
-// collide. It also answers a question nobody can answer today: do Chad's personal notes
-// actually produce reviews? They carry their own source, so the dashboard can say.
+// ── WHY THE LINK GOES STRAIGHT TO GOOGLE ────────────────────────────────────
+// The first build routed this through our own /g hop so the click would be recorded. Chad, on
+// reading it: "i want it to have a link straight to google they have already given a 5 star i
+// don't want to link them back to my page." He is right about the thing that matters here. In
+// a PLAIN-TEXT note there is no anchor text to hide a URL behind — the customer reads the URL
+// itself, and a tracking.davisdelivery.com/g?rid=… line in a personal thank-you looks like
+// being handed back to the machine that already emailed them once. The whole point of this
+// note is that it is not that.
+//
+// THE COST, AND IT IS REAL, so it is written down rather than discovered later: lib/followup-
+// core stands its automatic nudge down only when googleClickAt is stamped, and only the /g hop
+// stamps it. A customer who takes THIS link stays invisible to that job, so they can still get
+// the robot's nudge (2h-7d, REVIEW_FOLLOWUP_ENABLED defaults on) after Chad has already
+// written to them personally — and both messages now say the same thing, because this note
+// carries the same apology. The lever for that is REVIEW_FOLLOWUP_ENABLED=0, which is Chad's
+// call, not a code change.
+//
+// ── THE APOLOGY SAYS "LOOKS LIKE", NOT "DID NOT" ────────────────────────────
+// Chad: "also want to apologize that their review didn't make it to google". The reason it
+// keeps happening is real and is documented in this repo — Google sends a signed-out visitor
+// to accounts.google.com instead of a review box, and in an email client's in-app browser that
+// is most of them. But this alert is sent the moment the customer hits Send, before anybody
+// has clicked anything: the alert's own footer says so. So at the instant this note is
+// written, whether the review reached Google is UNKNOWN, and asserting it did not is a claim
+// about a stranger's behaviour we have not observed. It is hedged for that reason, and it also
+// takes the blame off them, which is the version that gets a second attempt rather than a
+// shrug. Chad can delete the sentence in two taps on the days the dashboard already shows the
+// click.
 //
 // ── WHY IT REFUSES A PHONE NUMBER ───────────────────────────────────────────
 // The contact field on the review form collects "email or phone" and people use both — the
@@ -68,11 +87,14 @@ function thanksBody({ name, driver, googleUrl }) {
     "",
     about,
     "",
-    "If you have thirty seconds, would you mind saying the same on Google? We're family-owned, and reviews are how new customers find us:",
+    "I'm sorry — it looks like your review didn't make it through to Google. That's not on you: Google makes you sign in first, and it catches a lot of people out on a phone.",
+    "",
+    "If you still have a minute, this goes straight there:",
     "",
     googleUrl,
     "",
-    "Thanks again,",
+    "We're family-owned, and reviews are how new customers find us. Thank you either way.",
+    "",
     "Chad Blyth",
     "Davis Delivery Service",
   ].join("\n");
@@ -109,7 +131,7 @@ function ownerThanksMailto({ review, googleUrl } = {}) {
   // Over the cap, drop the pleasantries rather than the link: a note that arrives without its
   // Google URL is the one outcome this whole thing exists to prevent.
   if (href.length > MAILTO_MAX) {
-    const short = [name ? `Hi ${name},` : "Hi there,", "", "Thank you for the review — it means a lot.", "", link, "", "Chad Blyth", "Davis Delivery Service"].join("\n");
+    const short = [name ? `Hi ${name},` : "Hi there,", "", "Thank you for the review — it means a lot.", "", "It looks like it didn't make it through to Google. If you still have a minute, this goes straight there:", "", link, "", "Chad Blyth", "Davis Delivery Service"].join("\n");
     const shortHref = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(short)}`;
     return { to, subject, body: short, href: shortHref };
   }
