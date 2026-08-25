@@ -15,7 +15,7 @@
 
 // The company's Google review page. ONE definition — this string used to live inline in
 // review.js, and every new reader was one more chance to paste a slightly different one.
-const GOOGLE_REVIEW_URL = "https://g.page/r/CcBkxtEUiFOGEAE/review";
+const GOOGLE_REVIEW_URL = "https://g.page/r/CcBkxtEUiFOGEBM/review";
 
 function blobStore(name) {
   const { getStore } = require("@netlify/blobs");
