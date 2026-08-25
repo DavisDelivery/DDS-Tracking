@@ -134,6 +134,12 @@ const {
   trackedGoogleUrl, cleanRef, withClicks,
 } = require("./lib/reviews");
 
+const { ownerThanksMailto, mailtoAttr } = require("./lib/owner-thanks");
+
+// Same variable, same default as lib/followup-core — there is one tracking origin and a
+// second opinion about it here would send half the click hops to a host that is not serving.
+const SITE_ORIGIN = (process.env.REVIEW_SITE_ORIGIN || "https://tracking.davisdelivery.com").replace(/\/+$/, "");
+
 const {
   extractCustomer, extractPodDocs, selectPhotos, customerBlockHtml, photosBlockHtml, esc,
 } = require("./lib/stop-context");
@@ -422,6 +428,27 @@ exports.handler = async (event) => {
   // Heads-up on 5-star reviews too — not just route to Google silently — so
   // the owner sees the win in real time. (4-star still routes to Google with
   // no email; ≤3-star sends the alert above.)
+  //
+  // THE OWNER'S THANK-YOU, prepared but not sent. Chad asked to be able to tap the customer's
+  // address in this alert and have a thank-you with the Google link already written — sent
+  // from his own mailbox, so it reads like a person rather than a second robot. The link
+  // inside it is the TRACKED hop, not g.page: see lib/owner-thanks for why that is what stops
+  // the automatic follow-up mailing somebody he has already asked.
+  const thanks = ownerThanksMailto({
+    review,
+    googleUrl: trackedGoogleUrl(review.clickRef || review.id, SITE_ORIGIN, "owner-thanks"),
+  });
+  // No address to write to (the field also collects phone numbers) → the contact stays plain
+  // text and no button appears. A mailto: to a phone number opens a compose window that looks
+  // fine and goes nowhere, which is worse than no link at all.
+  const contactHtml = thanks
+    ? `<a href="${mailtoAttr(thanks.href)}" style="color:#1e5b92">${esc(review.contact)}</a>`
+    : (esc(review.contact) || "Not provided");
+  const thanksHtml = thanks
+    ? `<p style="margin:16px 0 4px"><a href="${mailtoAttr(thanks.href)}" style="display:inline-block;background:#15803d;color:#fff;padding:13px 22px;border-radius:6px;font-weight:700;text-decoration:none;font-size:15px">✉️ Thank them &amp; ask for a Google review</a></p>
+                <p style="color:#666;font-size:12px;margin:0 0 4px">Opens your mail app with the note already written — read it, change anything, send.</p>`
+    : '';
+
   if (rating === 5 && RESEND_API_KEY) {
     try {
       const posRes = await fetch("https://api.resend.com/emails", {
@@ -446,8 +473,9 @@ exports.handler = async (event) => {
                 <p style="margin:6px 0"><strong>PRO #:</strong> ${review.proNumber || "Not provided"}</p>
                 <p style="margin:6px 0"><strong>Driver:</strong> ${review.driver || "Unattributed"}</p>
                 <p style="margin:6px 0"><strong>Review left by:</strong> ${esc(review.name) || "Anonymous"}</p>
-                <p style="margin:6px 0"><strong>Their contact:</strong> ${esc(review.contact) || "Not provided"}</p>
+                <p style="margin:6px 0"><strong>Their contact:</strong> ${contactHtml}</p>
                 ${review.comment ? `<div style="background:#f0f9f3;padding:16px;border-left:4px solid #15803d;margin:16px 0;border-radius:4px"><strong>What they said:</strong><br>${review.comment.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ''}
+                ${thanksHtml}
                 ${customerHtml}
                 ${photosHtml}
                 <p style="color:#666;font-size:12px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f2f5">Submitted ${new Date(review.submittedAt).toLocaleString("en-US", { timeZone: "America/New_York" })} EST</p>

@@ -109,7 +109,7 @@ function cleanRef(v) {
 // recorded as "other" rather than stored verbatim, so the dashboard can never be made to
 // display arbitrary text and the source column can never quietly grow a long tail of
 // typos that look like real categories.
-const KNOWN_SOURCES = ["review-email", "track-email", "review-followup", "direct", "other"];
+const KNOWN_SOURCES = ["review-email", "track-email", "review-followup", "owner-thanks", "direct", "other"];
 
 // How a source reads to a human. Kept beside the allow-list so a new source cannot be added
 // without someone deciding what it is called in an inbox and on a dashboard.
@@ -117,6 +117,7 @@ const SOURCE_LABEL = {
   "review-email": "the delivery email's Rate button",
   "track-email": "the delivery email's Track link",
   "review-followup": "the review follow-up email",
+  "owner-thanks": "Chad's own thank-you note",
   direct: "the tracking site directly",
   other: "an unrecognised link",
 };
