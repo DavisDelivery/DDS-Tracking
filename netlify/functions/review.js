@@ -239,11 +239,36 @@ exports.handler = async (event) => {
         console.error("click store unreadable (non-fatal):", err && err.message);
       }
 
+      // THE SAME NOTE, BUILT WHERE THE ANSWER IS ACTUALLY KNOWN.
+      //
+      // The alert email is sent the instant the customer hits Send, so it cannot say whether
+      // the review reached Google — its own footer says so, and its note is hedged for it.
+      // HERE the click has either been stamped or it has not, which is the one place the
+      // sentence Chad asked for ("their review didn't make it to Google") is a fact rather
+      // than a guess. So each row carries its own note, graded by its own click state:
+      //   not taken  → the definite apology and the link
+      //   taken      → a thank-you with NO apology, NO link and NO ask. Apologising for a
+      //                review that did not fail, and asking again for one they may already
+      //                have left, spends goodwill for nothing.
+      //   untracked  → the hedged wording, because "no clickRef" means we never could tell.
+      // Built server-side from the same lib the alert uses, so the two can never drift.
+      const joined = withClicks(reviews, clicksByRef);
+      const withNotes = joined.map((r) => {
+        const trackable = !!(r && r.clickRef) && clicksReadable;
+        const clicked = r && r.googleClickAt ? true : (trackable ? false : null);
+        const t = ownerThanksMailto({
+          review: r, googleUrl: GOOGLE_REVIEW_URL, fallbackTo: r && r.customerEmail, clicked,
+        });
+        return t
+          ? { ...r, thanksHref: t.href, thanksTo: t.to, thanksRecipient: t.recipient, thanksClicked: t.clicked }
+          : r;
+      });
+
       return {
         statusCode: 200,
         headers,
         body: JSON.stringify({
-          reviews: withClicks(reviews, clicksByRef), backfilled, clicksReadable,
+          reviews: withNotes, backfilled, clicksReadable,
         }),
       };
     } catch (err) {
@@ -371,6 +396,30 @@ exports.handler = async (event) => {
   const customerHtml = customerBlockHtml(customer, { pro: proClean });
   const photosHtml = photosBlockHtml({ photos, otherDocs, pro: proClean, resolved: !!wrap });
 
+  // KEEP THE ORDER'S ADDRESS ON THE RECORD, so the dashboard can offer the same button.
+  //
+  // The alert has `customer` in hand; the dashboard does not — it reads the stored review and
+  // nothing else, and re-resolving the PRO there would put a NuVizz call on every page load.
+  // Without this field an anonymous five-star (the exact case Chad hit) can never get a button
+  // on the dashboard either, no matter what we know by then about the Google click.
+  //
+  // RE-READ, THEN MERGE. Never setDoc-style over the whole record: the follow-up mailer can
+  // stamp followupClaimedAt on the same key in this window, and a blind write erases it and
+  // sends the customer a second "would you post a review?". Same hazard, same fix as the
+  // driver backfill below. Best-effort — a review that stores without this field simply has
+  // no dashboard button, which is where it already was.
+  if (customer && customer.email) {
+    try {
+      const store = reviewsStore();
+      const current = (await store.get(review.id, { type: "json" })) || review;
+      await store.setJSON(review.id, {
+        ...current,
+        customerEmail: customer.email,
+        customerName: customer.name || "",
+      });
+    } catch (e) { /* non-fatal: the alert below still carries the button */ }
+  }
+
   // Email if rating is 3 or below
   if (rating <= 3 && RESEND_API_KEY) {
     try {
@@ -434,16 +483,37 @@ exports.handler = async (event) => {
   // anchor text to hide a URL behind, so the customer reads whichever one we put there. The
   // cost — this click cannot stamp googleClickAt, so the automatic follow-up may still nudge
   // someone he has written to personally — is spelled out in lib/owner-thanks.
-  const thanks = ownerThanksMailto({ review, googleUrl: GOOGLE_REVIEW_URL });
+  //
+  // AND WHEN THE REVIEWER LEFT NO ADDRESS, THE ORDER'S CONTACT IS THE FALLBACK. Chad, on a
+  // five-star alert with no button on it: "Where is my button to generate my email to customer
+  // saying their review didn't make it to Google". That review was anonymous with no contact,
+  // so ownerThanksMailto returned null and the button vanished — while the customer's own
+  // address sat 200px further down the same email, linked as a bare mailto that opens an EMPTY
+  // compose window. The reviewer's address still wins whenever there is one; this only fills
+  // the case where there was none at all, and the note says what is actually true (somebody
+  // there rated a delivery, anonymously) rather than thanking a named person for a review they
+  // may not have written.
+  const thanks = ownerThanksMailto({
+    review, googleUrl: GOOGLE_REVIEW_URL, fallbackTo: customer && customer.email,
+  });
   // No address to write to (the field also collects phone numbers) → the contact stays plain
   // text and no button appears. A mailto: to a phone number opens a compose window that looks
   // fine and goes nowhere, which is worse than no link at all.
-  const contactHtml = thanks
+  const contactHtml = thanks && thanks.recipient === "reviewer"
     ? `<a href="${mailtoAttr(thanks.href)}" style="color:#1e5b92">${esc(review.contact)}</a>`
     : (esc(review.contact) || "Not provided");
+  // WHO THE BUTTON WRITES TO, ON THE BUTTON. Chad taps this on a phone without reading the
+  // rest of the card; a button that silently addressed the account contact instead of the
+  // reviewer would be the kind of surprise that gets found after it is sent.
+  const thanksLabel = thanks && thanks.recipient === "account"
+    ? "✉️ Write to the customer &amp; ask for a Google review"
+    : "✉️ Thank them &amp; ask for a Google review";
+  const thanksNote = thanks && thanks.recipient === "account"
+    ? `Goes to <strong>${esc(thanks.to)}</strong>, the contact on the order — the review itself was left anonymously. Opens your mail app with the note already written.`
+    : "Opens your mail app with the note already written — read it, change anything, send.";
   const thanksHtml = thanks
-    ? `<p style="margin:16px 0 4px"><a href="${mailtoAttr(thanks.href)}" style="display:inline-block;background:#15803d;color:#fff;padding:13px 22px;border-radius:6px;font-weight:700;text-decoration:none;font-size:15px">✉️ Thank them &amp; ask for a Google review</a></p>
-                <p style="color:#666;font-size:12px;margin:0 0 4px">Opens your mail app with the note already written — read it, change anything, send.</p>`
+    ? `<p style="margin:16px 0 4px"><a href="${mailtoAttr(thanks.href)}" style="display:inline-block;background:#15803d;color:#fff;padding:13px 22px;border-radius:6px;font-weight:700;text-decoration:none;font-size:15px">${thanksLabel}</a></p>
+                <p style="color:#666;font-size:12px;margin:0 0 4px">${thanksNote}</p>`
     : '';
 
   if (rating === 5 && RESEND_API_KEY) {

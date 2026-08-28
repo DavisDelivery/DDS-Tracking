@@ -31,6 +31,13 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:#f8f9fb;color:#1f2937
 .meta{font-size:12px;color:#97a3b3}
 .meta strong{color:#5a6779;font-weight:600}
 .empty{text-align:center;padding:80px 20px;color:#97a3b3}
+/* WRITE TO THEM, FROM HERE. Sized for a thumb — Chad reads this dashboard on a phone, and a
+   12px text link beside a 10px tag is not a target. Green for the ask, slate for the no-ask
+   thank-you, so the two are never confused at a glance. */
+.write{display:inline-block;margin-top:10px;padding:12px 16px;border-radius:7px;font-size:13px;font-weight:700;text-decoration:none;line-height:1.2}
+.write-ask{background:#15803d;color:#fff}
+.write-plain{background:#eef1f5;color:#42505f}
+.write-why{font-size:11px;color:#97a3b3;margin-top:5px;line-height:1.45}
 </style>
 </head>
 <body>
@@ -70,6 +77,40 @@ function fmtDate(iso){return new Date(iso).toLocaleString("en-US",{month:"short"
 // How a source reads to a human. Mirrors SOURCE_LABEL in netlify/functions/lib/reviews.js.
 const SRC_LABEL={"review-email":"Rate button (delivery email)","track-email":"Track link (delivery email)","review-followup":"Follow-up email",direct:"Direct visit",other:"Unrecognised link"};
 
+// THE BUTTON CHAD ASKED FOR, ON THE SCREEN THAT ACTUALLY KNOWS THE ANSWER.
+//
+// "Where is my button to generate my email to customer saying their review didn't make it to
+// Google" — asked of a five-star ALERT, which is sent the instant the customer hits Send and
+// therefore cannot know yet. This row can: googleClickAt is stamped by g.js on a real click
+// and by nothing else. So the wording is graded by what the row actually shows, and a review
+// that DID reach Google gets a thank-you with no apology and no second ask, rather than the
+// same note with its facts wrong.
+//
+// The href is built server-side by lib/owner-thanks — the same function the alert email uses —
+// so the note is identical whichever surface he taps, and the two cannot drift. Nothing is
+// sent from here: it opens his own compose window and he decides.
+//
+// No href means no address on file (anonymous review AND no email on the order, or a record
+// that predates customerEmail). The row says so rather than showing a dead button, because a
+// button that opens an empty compose window is the thing being fixed.
+function writeBlock(r){
+  if(!r||!r.thanksHref){
+    if(r&&r.routedTo==="google"&&!r.googleClickAt) return '<div class="write-why">No email on file for this one — nothing to write to.</div>';
+    return "";
+  }
+  const took=r.thanksClicked===true;
+  const label=took?"\u2709\ufe0f Say thank you"
+    :(r.thanksRecipient==="account"?"\u2709\ufe0f Write to the customer &amp; ask for the Google review"
+      :"\u2709\ufe0f Ask them for the Google review");
+  const acct=r.thanksRecipient==="account"?", the contact on the order (the review was anonymous)":"";
+  const why=took
+    ? `They took the Google link, so this note carries no second ask. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
+    : (r.thanksClicked===false
+      ? `The link was shown and not taken \u2014 the note says exactly that and links straight to Google. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
+      : `We can't tell whether this one reached Google, so the note is worded \u201clooks like\u201d. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`);
+  return `<a class="write ${took?"write-plain":"write-ask"}" href="${esc(r.thanksHref).replace(/&/g,"&amp;")}">${label}</a>
+      <div class="write-why">${why}</div>`;
+}
 function renderDashboard(reviews,clicksReadable){
   const googleCount=reviews.filter(r=>r.routedTo==="google").length;
   const internalCount=reviews.filter(r=>r.routedTo==="internal").length;
@@ -123,6 +164,7 @@ function renderDashboard(reviews,clicksReadable){
         ${r.comment?`<div class="comment">${esc(r.comment)}</div>`:""}
         <div class="meta">PRO# <strong>${esc(r.proNumber)||"—"}</strong> · ${esc(fmtDate(r.submittedAt))}${r.driver?` · Driver <strong>${esc(r.driver)}</strong>`:""}</div>
         <div class="meta" style="margin-top:3px">Came from <strong>${esc(SRC_LABEL[r.source]||(r.source?r.source:"Not recorded"))}</strong>${r.googleClickAt?` · Took the Google link ${esc(fmtDate(r.googleClickAt))}${r.googleClickCount>1?` (${Number(r.googleClickCount)||0}×)`:""}`:""}${r.googleClickProbes?` · ${Number(r.googleClickProbes)||0} bot fetch${r.googleClickProbes>1?"es":""} (not counted)`:""}</div>
+        ${writeBlock(r)}
       </div>
     `).join("");
   }

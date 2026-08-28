@@ -162,3 +162,122 @@ test('an absurd driver name still yields the REAL note, not the stripped fallbac
   const shown = (t.body.match(/kind words about (x+)/) || [])[1] || '';
   assert.ok(shown.length <= 40, `driver ran to ${shown.length} chars in the note`);
 });
+
+// ── THE ANONYMOUS FIVE-STAR, AND THE BUTTON THAT WASN'T THERE ────────────────
+//
+// Chad, holding a five-star alert with no button on it: "Where is my button to generate my
+// email to customer saying their review didn't make it to Google". PRO 007168192,
+// MANUFACTURING INDUSTRIES — "Review left by: Anonymous / Their contact: Not provided", with
+// MARYANN.MEDLIN@MFGINDUSTRIES.COM sitting 200px further down the same email in the Customer
+// block, linked as a bare mailto that opens an EMPTY compose window.
+const ANON = { contact: '', name: '', driver: 'OYIEKE NELSON', proNumber: '007168192' };
+const ORDER_EMAIL = 'MARYANN.MEDLIN@MFGINDUSTRIES.COM';
+
+test('THE BUG: an anonymous review with no contact had nothing to offer', () => {
+  // Unchanged when there is genuinely no address anywhere — this is what Chad hit.
+  assert.equal(ownerThanksMailto({ review: ANON, googleUrl: LINK }), null);
+});
+
+test('THE FIX: with an address on the order, the note goes there', () => {
+  const t = ownerThanksMailto({ review: ANON, googleUrl: LINK, fallbackTo: ORDER_EMAIL });
+  assert.ok(t);
+  assert.equal(t.to, ORDER_EMAIL);
+  assert.equal(t.recipient, 'account');
+  assert.ok(t.body.includes(LINK));
+});
+
+test('the REVIEWER always wins — the order contact is a fallback, never a preference', () => {
+  // Chad: "Think we should send to the ones who sent not the one on the account." That order
+  // is load-bearing and this is the test that holds it.
+  const t = ownerThanksMailto({ review: review(), googleUrl: LINK, fallbackTo: ORDER_EMAIL });
+  assert.equal(t.to, 'w743mbr@gmail.com');
+  assert.equal(t.recipient, 'reviewer');
+});
+
+test('a phone number in the contact field still falls through to the order address', () => {
+  const t = ownerThanksMailto({ review: review({ contact: '7702428585' }), googleUrl: LINK, fallbackTo: ORDER_EMAIL });
+  assert.equal(t.to, ORDER_EMAIL);
+  assert.equal(t.recipient, 'account');
+});
+
+test('a phone number on the order is refused too — it is not an address', () => {
+  assert.equal(ownerThanksMailto({ review: ANON, googleUrl: LINK, fallbackTo: '7066465000' }), null);
+});
+
+test('the note to an ACCOUNT contact never thanks them for a review they may not have written', () => {
+  const t = ownerThanksMailto({ review: ANON, googleUrl: LINK, fallbackTo: ORDER_EMAIL });
+  // "Thank you for the kind words" to a person who did not write them is a mail-merge misfire.
+  assert.doesNotMatch(t.body, /Thank you for the kind words/);
+  assert.doesNotMatch(t.body, /your review/);
+  assert.match(t.body, /Someone at your company/);
+  assert.match(t.body, /anonymously/);
+  assert.match(t.body, /Oyieke/);              // the driver is still named and still cased
+});
+
+// ── WHAT WE KNOW ABOUT GOOGLE, AND WHERE WE KNOW IT ──────────────────────────
+test('in the ALERT (clicked unknown) the apology stays hedged', () => {
+  // The alert is sent the instant the customer hits Send; its own footer says nobody knows yet.
+  const t = ownerThanksMailto({ review: review(), googleUrl: LINK });
+  assert.equal(t.clicked, null);
+  assert.match(t.body, /it looks like your review didn't make it through to Google/);
+});
+
+test('on the DASHBOARD, a link shown and not taken gets the DEFINITE apology', () => {
+  // Here it is observed: g.js stamps googleClickAt on a real click and on nothing else.
+  const t = ownerThanksMailto({ review: review(), googleUrl: LINK, clicked: false });
+  assert.match(t.body, /I'm sorry — your review didn't make it through to Google/);
+  assert.doesNotMatch(t.body, /looks like/);
+  assert.ok(t.body.includes(LINK));
+});
+
+test('a review that DID reach Google gets no apology, no link and no second ask', () => {
+  // Apologising for a review that did not fail, and asking again for one they may already have
+  // left, is worse than sending nothing at all.
+  const t = ownerThanksMailto({ review: review(), googleUrl: LINK, clicked: true });
+  assert.ok(t);
+  assert.equal(t.clicked, true);
+  assert.doesNotMatch(t.body, /sorry/i);
+  assert.doesNotMatch(t.body, /didn't make it/);
+  assert.ok(!t.body.includes(LINK), 'the note must not carry the review link');
+  assert.doesNotMatch(t.body, /minute/);       // no "if you still have a minute"
+  assert.match(t.body, /Trevarr/);             // it is still a thank-you
+});
+
+// REACHING THE OVER-CAP BRANCH AT ALL takes a long ADDRESS, not a long driver name — the
+// 40-char clamp means no driver can push the note over. The two length tests above therefore
+// never enter the fallback; they pass on the normal note. This one does enter it, proved by
+// the assertion that the body IS the stripped text.
+const LONG_TO = `${'a'.repeat(1900)}@mfgindustries.com`;
+
+test('the over-cap fallback is genuinely reached by a long address', () => {
+  const t = ownerThanksMailto({ review: review({ contact: LONG_TO }), googleUrl: LINK });
+  assert.equal(t.to, LONG_TO);
+  assert.match(t.body, /Thank you for the review — it means a lot\./, 'this is the stripped note');
+  assert.ok(t.body.includes(LINK), 'and the link is what the stripping protects');
+});
+
+test('the no-ask note survives the over-cap fallback WITHOUT gaining a link', () => {
+  // The stripped note exists to protect the link. For this one variant that would be the bug:
+  // the cap must not smuggle a second ask into a note that deliberately has none, because the
+  // recipient has already been to Google.
+  const t = ownerThanksMailto({ review: review({ contact: LONG_TO }), googleUrl: LINK, clicked: true });
+  assert.match(t.body, /Thank you for the review — it means a lot\./, 'the stripped note, so the branch ran');
+  assert.ok(!t.body.includes(LINK), 'no link may be smuggled back in');
+  assert.doesNotMatch(t.body, /didn't make it/);
+  assert.doesNotMatch(t.body, /minute/);
+});
+
+test('a thank-you with no link is still refused for every variant that asks', () => {
+  assert.equal(ownerThanksMailto({ review: review(), googleUrl: '' }), null);
+  assert.equal(ownerThanksMailto({ review: review(), googleUrl: '', clicked: false }), null);
+  // ...except the one that was never going to carry a link.
+  assert.ok(ownerThanksMailto({ review: review(), googleUrl: '', clicked: true }));
+});
+
+test('empty, absent and malformed still produce nothing rather than a half-built mailto', () => {
+  assert.equal(ownerThanksMailto(), null);
+  assert.equal(ownerThanksMailto({}), null);
+  assert.equal(ownerThanksMailto({ review: null, googleUrl: LINK }), null);
+  assert.equal(ownerThanksMailto({ review: ANON, googleUrl: LINK, fallbackTo: null }), null);
+  assert.equal(ownerThanksMailto({ review: ANON, googleUrl: LINK, fallbackTo: '   ' }), null);
+});
