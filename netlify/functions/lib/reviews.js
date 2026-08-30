@@ -141,6 +141,107 @@ function normalizeSource(raw) {
 // instant can both read 0 and both write 1. It is therefore a LOWER BOUND on clicks, not a
 // tally — worth having, not worth trusting to the unit. firstAt, the field everything else
 // keys on, is unaffected: either writer sets it to the same truth.
+// ── WHICH BROWSER DID THE HAND-OFF HAPPEN IN? ────────────────────────────────
+//
+// Chad: "You currently think it's them not logging in that is stopping them." He was right to
+// push. What is PROVEN is that Google's server 302s a signed-out request on our review link
+// to accounts.google.com/ServiceLogin — run directly against the live link. What is NOT
+// proven, and what was being asserted anyway, is that any actual customer was signed out.
+// Most people are signed into Google on a phone.
+//
+// Three explanations fit "arrived at Google, no review appeared" equally well:
+//   1. SIGNED OUT. An email client's in-app webview keeps its own cookie jar, separate from
+//      Safari or Chrome, so a customer signed in everywhere else still meets a login page.
+//   2. THEY STARTED OVER. Our link carries no rating and no text, so they face five empty
+//      stars and an empty box after already doing both on our page. (Confirmed against the
+//      posted reviews: the words on Google are not the words from our form.)
+//   3. GOOGLE FILTERED IT. The link carries laa=nmx-review-solicitation-ia2 — Google knows
+//      it is solicited, and thin-history or bursty reviews get held.
+//
+// Only (1) predicts that the failures CONCENTRATE in in-app webviews while the successes sit
+// in real browsers. That is a distinguishing prediction, and it needs one thing we were not
+// recording: what the customer was using. stampClick stored the timestamp, the count, the
+// probes and the source — never the client.
+//
+// A HEURISTIC, AND LABELLED AS ONE. User agents lie, and reading too much into one is the
+// exact failure this repo keeps having. So the raw string is kept alongside the verdict:
+// a bucket nobody can check against the original is a number that cannot be audited.
+//
+// THE KEY SIGNATURE is 'ios-inapp'. An iOS WKWebView hosted by another app sends a UA that
+// looks like Mobile Safari but omits the trailing "Safari/" token. That is the population the
+// signed-out theory says should be failing, and it is exactly the population that arrives by
+// tapping a button inside a delivery email.
+const CLIENT_MAX = 400;
+
+function clientKind(userAgent) {
+  // A NON-STRING IS ABSENT DATA, NOT A BROWSER. String(42) is "42", which matches none of the
+  // patterns below and would fall through to "other" — and "other" is a real browser, so it
+  // lands in the CONTROL arm and pads it. Garbage silently moving the answer is the precise
+  // way a measurement lies while every test stays green.
+  if (typeof userAgent !== "string") return "unknown";
+  const ua = userAgent.trim();
+  if (!ua) return "unknown";
+  const has = (re) => re.test(ua);
+
+  // Named in-app browsers first — these self-identify, so no inference is needed.
+  if (has(/\bFBAN\/|\bFBAV\/|FB_IAB/)) return "facebook-inapp";
+  if (has(/\bInstagram\b/)) return "instagram-inapp";
+  if (has(/Outlook-(iOS|Android)/i)) return "outlook-inapp";
+  if (has(/\bGSA\//)) return "google-app-inapp";       // the Google app's own webview
+
+  const ios = has(/\((iPhone|iPad|iPod)/);
+  const android = has(/\bAndroid\b/);
+
+  // Branded iOS browsers announce themselves, and they are NOT webviews.
+  if (ios && has(/\bCriOS\//)) return "chrome-ios";
+  if (ios && has(/\bFxiOS\//)) return "firefox-ios";
+  if (ios && has(/\bEdgiOS\//)) return "edge-ios";
+
+  // THE ONE THAT MATTERS. Real Mobile Safari ends with a "Safari/<version>" token; a
+  // WKWebView embedded in another app does not. Everything above is excluded first so a
+  // branded browser can never fall into this bucket.
+  if (ios && has(/AppleWebKit/) && !has(/\bSafari\//)) return "ios-inapp";
+  if (ios) return "safari-ios";
+
+  // Android's embedded WebView marks itself with "; wv" in the platform token.
+  if (android && has(/;\s*wv\b/)) return "android-inapp";
+  if (android && has(/\bChrome\//)) return "chrome-android";
+  if (android) return "android-other";
+
+  if (has(/\bEdg\//)) return "edge-desktop";
+  if (has(/\bChrome\//)) return "chrome-desktop";
+  if (has(/\bFirefox\//)) return "firefox-desktop";
+  if (has(/\bSafari\//)) return "safari-desktop";
+  return "other";
+}
+
+// AN EXPLICIT LIST, NOT A NAMING CONVENTION. This started as /-inapp$/ on the bucket name,
+// which works only for as long as nobody adds a bucket whose name happens to contain the
+// word — and this string decides which ARM of the experiment a customer lands in, so a
+// silent misfile moves the answer rather than breaking anything visible. Every kind
+// clientKind can return is listed here or in CLIENT_KINDS, and a test fails if a new one is
+// added without someone deciding which side of the line it belongs on.
+const IN_APP_KINDS = new Set([
+  "ios-inapp", "android-inapp", "outlook-inapp",
+  "google-app-inapp", "facebook-inapp", "instagram-inapp",
+]);
+
+// Every verdict clientKind can produce. The test that enumerates this is the point of it:
+// adding a bucket without classifying it is the mistake it exists to catch.
+const CLIENT_KINDS = [
+  ...IN_APP_KINDS,
+  "chrome-ios", "firefox-ios", "edge-ios", "safari-ios",
+  "chrome-android", "android-other",
+  "edge-desktop", "chrome-desktop", "firefox-desktop", "safari-desktop",
+  "other", "unknown",
+];
+
+/** PURE. Is this client one whose cookie jar is isolated from the customer's real browser?
+ *  The signed-out theory predicts the failures live HERE and nowhere else. */
+function isInAppWebview(kind) {
+  return IN_APP_KINDS.has(String(kind || ""));
+}
+
 function stampClick(prevClick, nowIso, extra, navigational = true) {
   const prev = prevClick && typeof prevClick === "object" ? prevClick : {};
   const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -194,8 +295,74 @@ function withClicks(reviews, clicksByRef) {
       // it and, until now, nothing read it — a field stored for a stated purpose it did not
       // actually serve.
       googleClickSource: (hit && hit.source) || null,
+      // WHAT THEY TAPPED IT IN. The distinguishing signal for "why did half of them not
+      // post" — see clientKind. Null on every click recorded before this shipped, which is
+      // "we were not looking", not "unknown browser", and the dashboard says so.
+      googleClient: (hit && hit.client) || null,
+      googleClientUA: (hit && hit.ua) || null,
     };
   });
+}
+
+// ── THE ANSWER, WHEN THERE IS ENOUGH OF IT TO BE ONE ─────────────────────────
+//
+// PURE. Joins what we recorded (which browser they tapped in) to what only Chad can see
+// (whether the review appeared on Google) and reports the split.
+//
+// The signed-out theory predicts one specific shape: the post rate inside in-app webviews
+// should be markedly WORSE than in real browsers, because only the webview's cookie jar is
+// isolated. If both come out the same, the theory is wrong and the cause is elsewhere —
+// Google filtering solicited reviews, or people simply not starting over on a blank form.
+//
+// IT REFUSES TO CONCLUDE ON THIN DATA, and that refusal is the point. Davis gets one or two
+// five-star reviews a day; a 2-of-3 split is noise, and the whole reason this function
+// exists is that a plausible story fitted to a small sample is what went wrong the first
+// time. `sufficient` is false until both arms have MIN_PER_ARM checked rows, and the caller
+// is expected to print the counts and no verdict until then.
+const MIN_PER_ARM = 5;
+
+function postRateByClient(reviews) {
+  const rows = (reviews || []).filter((r) => r && r.googleClickAt);   // arrived at Google
+  const blank = () => ({ arrived: 0, checked: 0, landed: 0, missing: 0 });
+  const byClient = {};
+  const inApp = blank();
+  const browser = blank();
+  const unknownClient = blank();
+
+  for (const r of rows) {
+    const kind = r.googleClient || null;
+    const bucket = byClient[kind || "not-recorded"] || (byClient[kind || "not-recorded"] = blank());
+    // A click stamped before the client was recorded is NOT an unknown browser — it is a
+    // period when nothing was looking. Kept in its own bucket so it can never be averaged
+    // into either arm and quietly move the answer.
+    const arm = kind == null ? unknownClient : (isInAppWebview(kind) ? inApp : browser);
+    for (const b of [bucket, arm]) {
+      b.arrived += 1;
+      if (r.postedOnGoogle === true) { b.checked += 1; b.landed += 1; }
+      else if (r.postedOnGoogle === false) { b.checked += 1; b.missing += 1; }
+    }
+  }
+
+  const rate = (b) => (b.checked ? b.landed / b.checked : null);
+  const sufficient = inApp.checked >= MIN_PER_ARM && browser.checked >= MIN_PER_ARM;
+  return {
+    minPerArm: MIN_PER_ARM,
+    arrived: rows.length,
+    checked: rows.filter((r) => r.postedOnGoogle === true || r.postedOnGoogle === false).length,
+    unchecked: rows.filter((r) => r.postedOnGoogle !== true && r.postedOnGoogle !== false).length,
+    byClient,
+    inApp: { ...inApp, rate: rate(inApp) },
+    browser: { ...browser, rate: rate(browser) },
+    notRecorded: { ...unknownClient, rate: rate(unknownClient) },
+    sufficient,
+    // Stated as a comparison, never as a cause. Even with enough rows this says which arm
+    // does worse, not why — Google filtering could also concentrate somewhere.
+    leans: sufficient
+      ? (rate(inApp) < rate(browser) ? "in-app webviews post less often"
+        : rate(inApp) > rate(browser) ? "in-app webviews post MORE often — the sign-in theory does not hold"
+        : "no difference between in-app and real browsers")
+      : null,
+  };
 }
 
 // ── FOLLOW-UP ────────────────────────────────────────────────────────────────
@@ -251,6 +418,13 @@ function followupEligible(review, nowMs) {
 
 module.exports = {
   GOOGLE_REVIEW_URL,
+  clientKind,
+  CLIENT_KINDS,
+  IN_APP_KINDS,
+  postRateByClient,
+  MIN_PER_ARM,
+  isInAppWebview,
+  CLIENT_MAX,
   blobStore,
   clicksStore,
   validRef,
