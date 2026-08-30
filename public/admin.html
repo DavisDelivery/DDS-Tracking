@@ -38,6 +38,23 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:#f8f9fb;color:#1f2937
 .write-ask{background:#15803d;color:#fff}
 .write-plain{background:#eef1f5;color:#42505f}
 .write-why{font-size:11px;color:#97a3b3;margin-top:5px;line-height:1.45}
+/* WHICH BROWSER, AND DID IT LAND. The two facts that together answer "why does only half of
+   this reach Google". Marking is a 44px target because it gets done on a phone with the
+   Business Profile open in the other tab. */
+.client{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;background:#eef1f5;color:#5a6779;letter-spacing:.3px}
+.client-inapp{background:#fdf0e2;color:#a8632a}
+.landed-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.landed-q{font-size:12px;color:#5a6779;font-weight:600}
+.mark{min-height:44px;min-width:52px;padding:10px 14px;border-radius:7px;border:1px solid #dde2e8;background:#fff;color:#5a6779;font-size:13px;font-weight:700;cursor:pointer}
+.mark[aria-pressed="true"]{border-color:transparent;color:#fff}
+.mark-yes[aria-pressed="true"]{background:#15803d}
+.mark-no[aria-pressed="true"]{background:#d63b3b}
+.probe{background:#fff;border:1px solid #dde2e8;border-left:4px solid #e8a838;border-radius:10px;padding:16px;margin-bottom:12px}
+.probe h3{font-family:"Plus Jakarta Sans",sans-serif;font-size:15px;color:#0a2744;margin-bottom:6px}
+.probe p{font-size:13px;color:#5a6779;line-height:1.55}
+.probe table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
+.probe td{padding:5px 0;color:#5a6779}
+.probe td:last-child{text-align:right;font-weight:700;color:#0a2744}
 </style>
 </head>
 <body>
@@ -61,7 +78,7 @@ async function login(){
     if(!res.ok){document.getElementById("err").textContent="Invalid key";return}
     const data=await res.json();
     localStorage.setItem("dk",key);
-    renderDashboard(data.reviews||[],data.clicksReadable);
+    renderDashboard(data.reviews||[],data.clicksReadable,data.postRate);
   }catch(e){document.getElementById("err").textContent="Connection error"}
 }
 function logout(){localStorage.removeItem("dk");location.reload()}
@@ -103,15 +120,97 @@ function writeBlock(r){
     :(r.thanksRecipient==="account"?"\u2709\ufe0f Write to the customer &amp; ask for the Google review"
       :"\u2709\ufe0f Ask them for the Google review");
   const acct=r.thanksRecipient==="account"?", the contact on the order (the review was anonymous)":"";
+  // The wording follows the strongest fact available: a mark from the Business Profile if
+  // there is one, otherwise the click. "Shown and not taken" is only true when nobody has
+  // checked — once a row is marked "did not post" we know they DID take it and it still
+  // did not land, which is a different sentence.
+  const marked=r.postedOnGoogle===true||r.postedOnGoogle===false;
   const why=took
-    ? `They took the Google link, so this note carries no second ask. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
+    ? `${marked?"You marked this one as posted":"They took the Google link"}, so this note carries no second ask. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
     : (r.thanksClicked===false
-      ? `The link was shown and not taken \u2014 the note says exactly that and links straight to Google. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
+      ? `${r.postedOnGoogle===false?"You marked this one as never posting \u2014 the note says so and links straight to Google":"The link was shown and not taken \u2014 the note says exactly that and links straight to Google"}. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`
       : `We can't tell whether this one reached Google, so the note is worded \u201clooks like\u201d. Goes to <strong>${esc(r.thanksTo)}</strong>${acct}.`);
   return `<a class="write ${took?"write-plain":"write-ask"}" href="${esc(r.thanksHref).replace(/&/g,"&amp;")}">${label}</a>
       <div class="write-why">${why}</div>`;
 }
-function renderDashboard(reviews,clicksReadable){
+// Friendly names for the browser buckets. The raw verdict strings are stable identifiers;
+// these are for reading. An unrecorded client is NOT "unknown browser" — it is a click from
+// before we started looking, and it says so.
+const CLIENT_LABEL={
+  "ios-inapp":"in-app (iPhone email)","android-inapp":"in-app (Android)",
+  "outlook-inapp":"in-app (Outlook)","google-app-inapp":"in-app (Google app)",
+  "facebook-inapp":"in-app (Facebook)","instagram-inapp":"in-app (Instagram)",
+  "safari-ios":"Safari (iPhone)","chrome-ios":"Chrome (iPhone)","firefox-ios":"Firefox (iPhone)",
+  "edge-ios":"Edge (iPhone)","chrome-android":"Chrome (Android)","android-other":"Android browser",
+  "chrome-desktop":"Chrome (desktop)","safari-desktop":"Safari (desktop)",
+  "firefox-desktop":"Firefox (desktop)","edge-desktop":"Edge (desktop)",
+  "other":"other browser","unknown":"no browser sent",
+};
+function clientChip(r){
+  if(!r.googleClickAt)return"";
+  if(!r.googleClient)return`<span class="client" title="This click predates browser capture">browser not recorded</span>`;
+  const inapp=/-inapp$/.test(r.googleClient);
+  return `<span class="client ${inapp?"client-inapp":""}" title="${esc(r.googleClientUA||"")}">${esc(CLIENT_LABEL[r.googleClient]||r.googleClient)}</span>`;
+}
+
+// THE ONE FACT THIS SYSTEM CANNOT SEE FOR ITSELF. Google never tells us whether a review was
+// published, so the click is the furthest the machine can get on its own. Chad can read it
+// off his Business Profile in seconds; this is where that knowledge gets stored so the
+// machine can use it — for the split below, and so the apology note stops guessing.
+//
+// Only offered on rows that actually reached Google. Asking "did it post?" about someone who
+// never took the link is a question with no meaning.
+function landedRow(r){
+  if(!r.googleClickAt)return"";
+  const y=r.postedOnGoogle===true,n=r.postedOnGoogle===false;
+  return `<div class="landed-row">
+      <span class="landed-q">Did it post on Google?</span>
+      <button class="mark mark-yes" aria-pressed="${y}" onclick="markLanded('${esc(r.id)}',${y?"null":"true"})">Yes</button>
+      <button class="mark mark-no" aria-pressed="${n}" onclick="markLanded('${esc(r.id)}',${n?"null":"false"})">No</button>
+      ${y||n?'<span class="write-why" style="margin:0">Tap again to clear.</span>':'<span class="write-why" style="margin:0">Unanswered \u2014 not counted either way.</span>'}
+    </div>`;
+}
+
+async function markLanded(id,landed){
+  const key=localStorage.getItem("dk")||"";
+  try{
+    const res=await fetch("/.netlify/functions/review?key="+encodeURIComponent(key),{
+      method:"PATCH",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:id,landed:landed}),
+    });
+    if(!res.ok)throw new Error("save failed");
+    // Re-read rather than patching the DOM: the summary above has to move too, and a screen
+    // that shows a mark the server may not have taken is the failure this repo keeps having.
+    login();
+  }catch(e){ alert("Couldn't save that — check your connection and try again."); }
+}
+
+// WHY DOESN'T ALL OF THIS REACH GOOGLE? The panel that answers it, or says plainly that it
+// cannot yet. It never prints a conclusion below the row threshold: Davis gets one or two
+// five-star reviews a day, and a story fitted to three of them is exactly the mistake this
+// whole exercise exists to avoid.
+function probePanel(pr){
+  if(!pr)return"";
+  const pct=(b)=>b.checked?Math.round((b.landed/b.checked)*100)+"%":"—";
+  const line=(name,b)=>`<tr><td>${name}</td><td>${b.checked?`${b.landed} of ${b.checked} posted &middot; ${pct(b)}`:`${b.arrived} arrived, none checked yet`}</td></tr>`;
+  const need=Math.max(0,pr.minPerArm-pr.inApp.checked)+Math.max(0,pr.minPerArm-pr.browser.checked);
+  return `<div class="probe">
+      <h3>Why doesn't all of this reach Google?</h3>
+      <p>They all arrive &mdash; the click log proves that. What we're testing is whether the ones that never post are the ones who tapped inside an <strong>email app's built-in browser</strong>, where they're signed out of Google even when they're signed in everywhere else. Mark each review below Yes or No against your Business Profile and this fills in.</p>
+      <table>
+        ${line("In-app browsers",pr.inApp)}
+        ${line("Real browsers (Safari, Chrome&hellip;)",pr.browser)}
+        ${pr.notRecorded.arrived?line("Before we recorded the browser",pr.notRecorded):""}
+        <tr><td>Arrived at Google</td><td>${pr.arrived}</td></tr>
+        <tr><td>Checked so far</td><td>${pr.checked} of ${pr.arrived}</td></tr>
+      </table>
+      <p style="margin-top:10px">${pr.sufficient
+        ? `<strong>${esc(pr.leans)}.</strong> That is a comparison, not a cause &mdash; Google also filters solicited reviews, and that could concentrate in one group too.`
+        : `<strong>Not enough marked yet to say.</strong> Needs ${pr.minPerArm} checked in each group; ${need} more to go. Until then these are counts, not an answer.`}</p>
+    </div>`;
+}
+
+function renderDashboard(reviews,clicksReadable,postRate){
   const googleCount=reviews.filter(r=>r.routedTo==="google").length;
   const internalCount=reviews.filter(r=>r.routedTo==="internal").length;
   // The honest number. googleCount is how many were SHOWN the link; this is how many
@@ -148,6 +247,7 @@ function renderDashboard(reviews,clicksReadable){
       proof a review exists. Counts only reviews submitted since click tracking was added;
       older ones have no click record either way.${clicksReadable===false?' <strong style="color:#d63b3b">The click store could not be read on this load, so every row below shows no click.</strong>':''}
     </div>
+    ${probePanel(postRate)}
   `;
   if(!reviews.length){
     html+='<div class="empty"><div style="font-size:48px;margin-bottom:12px">⭐</div><div style="font-size:15px;color:#5a6779;font-weight:600">No reviews yet</div><div style="font-size:12px;margin-top:4px">Reviews submitted by customers will appear here</div></div>';
@@ -163,7 +263,8 @@ function renderDashboard(reviews,clicksReadable){
         </div>
         ${r.comment?`<div class="comment">${esc(r.comment)}</div>`:""}
         <div class="meta">PRO# <strong>${esc(r.proNumber)||"—"}</strong> · ${esc(fmtDate(r.submittedAt))}${r.driver?` · Driver <strong>${esc(r.driver)}</strong>`:""}</div>
-        <div class="meta" style="margin-top:3px">Came from <strong>${esc(SRC_LABEL[r.source]||(r.source?r.source:"Not recorded"))}</strong>${r.googleClickAt?` · Took the Google link ${esc(fmtDate(r.googleClickAt))}${r.googleClickCount>1?` (${Number(r.googleClickCount)||0}×)`:""}`:""}${r.googleClickProbes?` · ${Number(r.googleClickProbes)||0} bot fetch${r.googleClickProbes>1?"es":""} (not counted)`:""}</div>
+        <div class="meta" style="margin-top:3px">Came from <strong>${esc(SRC_LABEL[r.source]||(r.source?r.source:"Not recorded"))}</strong>${r.googleClickAt?` · Took the Google link ${esc(fmtDate(r.googleClickAt))}${r.googleClickCount>1?` (${Number(r.googleClickCount)||0}×)`:""}`:""}${r.googleClickProbes?` · ${Number(r.googleClickProbes)||0} bot fetch${r.googleClickProbes>1?"es":""} (not counted)`:""}${r.googleClickAt?` · ${clientChip(r)}`:""}</div>
+        ${landedRow(r)}
         ${writeBlock(r)}
       </div>
     `).join("");

@@ -131,7 +131,7 @@ async function resolveDriver(rawPro) {
 // them, and three hand-copied definitions is how they stop agreeing.
 const {
   GOOGLE_REVIEW_URL, reviewsStore, clicksStore, normalizeSource, SOURCE_LABEL,
-  trackedGoogleUrl, cleanRef, withClicks,
+  trackedGoogleUrl, cleanRef, withClicks, postRateByClient,
 } = require("./lib/reviews");
 
 const { ownerThanksMailto, mailtoAttr } = require("./lib/owner-thanks");
@@ -143,7 +143,7 @@ const {
 exports.handler = async (event) => {
   const headers = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, GET, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Content-Type": "application/json",
   };
@@ -255,7 +255,17 @@ exports.handler = async (event) => {
       const joined = withClicks(reviews, clicksByRef);
       const withNotes = joined.map((r) => {
         const trackable = !!(r && r.clickRef) && clicksReadable;
-        const clicked = r && r.googleClickAt ? true : (trackable ? false : null);
+        // WHAT WE KNOW BEATS WHAT WE INFERRED. googleClickAt says they ARRIVED at Google,
+        // which is the best the machine can do alone — and it is the wrong fact for this
+        // note. Once Chad has marked the row against his Business Profile we know whether a
+        // review actually appeared, so that answer wins outright.
+        //
+        // Without this the screen contradicts itself: a row marked "did not post" was still
+        // offering the no-apology, no-ask thank-you, because arriving had been treated as
+        // succeeding. Caught by rendering it and reading the card, not by a test.
+        const clicked = r && r.postedOnGoogle === true ? true
+          : r && r.postedOnGoogle === false ? false
+          : (r && r.googleClickAt ? true : (trackable ? false : null));
         const t = ownerThanksMailto({
           review: r, googleUrl: GOOGLE_REVIEW_URL, fallbackTo: r && r.customerEmail, clicked,
         });
@@ -269,6 +279,9 @@ exports.handler = async (event) => {
         headers,
         body: JSON.stringify({
           reviews: withNotes, backfilled, clicksReadable,
+          // Why half of them never appear on Google — computed, not guessed, and it declines
+          // to answer until both arms have enough rows. See postRateByClient.
+          postRate: postRateByClient(withNotes),
         }),
       };
     } catch (err) {
@@ -279,6 +292,50 @@ exports.handler = async (event) => {
 
   // DELETE = remove one or more reviews by id (key-gated). Used to purge test
   // records. ids may be a comma-separated list in ?id= or the JSON body.
+  // ── DID IT ACTUALLY LAND ON GOOGLE? ────────────────────────────────────────
+  //
+  // The one fact this system has never held, and the one it most needs. Google tells us
+  // nothing: a click means they ARRIVED, and the dashboard has always said so in as many
+  // words. Chad can see on his Business Profile which reviews appeared; until now that
+  // knowledge lived only in his head, so the machine could not use it for anything —
+  // not for the apology note's wording, and not for answering WHY half of them vanish.
+  //
+  // PATCH, key-gated, and deliberately BEFORE the customer's unauthenticated POST branch so
+  // the two can never be confused. Three states, and null is a real one: "not looked at yet"
+  // must stay distinguishable from "looked and it wasn't there", or the first summary this
+  // produces will report a 0% post rate for a week nobody has checked.
+  if (event.httpMethod === "PATCH") {
+    const q = event.queryStringParameters || {};
+    if (q.key !== (process.env.DASHBOARD_KEY || "davis2026")) {
+      return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
+    }
+    let body = {};
+    try { body = JSON.parse(event.body || "{}"); } catch {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid JSON" }) };
+    }
+    const id = String(body.id || "").trim();
+    if (!id) return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing id" }) };
+    // Anything that is not an explicit true/false clears the mark back to "not checked".
+    const landed = body.landed === true ? true : body.landed === false ? false : null;
+    try {
+      const store = reviewsStore();
+      // RE-READ, THEN MERGE ONE FIELD. Never write the record we think we have: the driver
+      // backfill and the follow-up mailer both touch the same key, and a blind write here
+      // would erase followupClaimedAt and mail the customer a second time.
+      const current = await store.get(id, { type: "json" });
+      if (!current) return { statusCode: 404, headers, body: JSON.stringify({ error: "No such review" }) };
+      await store.setJSON(id, {
+        ...current,
+        postedOnGoogle: landed,
+        postedOnGoogleAt: landed === null ? null : new Date().toISOString(),
+      });
+      return { statusCode: 200, headers, body: JSON.stringify({ ok: true, id, landed }) };
+    } catch (err) {
+      console.error("landed mark failed:", err && err.message);
+      return { statusCode: 500, headers, body: JSON.stringify({ error: "Write failed" }) };
+    }
+  }
+
   if (event.httpMethod === "DELETE") {
     const q = event.queryStringParameters || {};
     if (q.key !== (process.env.DASHBOARD_KEY || "davis2026")) {

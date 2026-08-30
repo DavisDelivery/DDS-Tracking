@@ -26,7 +26,7 @@
 // be blocked by our own bookkeeping, so every failure path below still ends in the 302: an
 // unknown id, an unreachable blob store, a malformed record, a write that throws. The
 // bookkeeping is best-effort; the hand-off is not.
-const { GOOGLE_REVIEW_URL, clicksStore, cleanRef, normalizeSource, stampClick } = require("./lib/reviews");
+const { GOOGLE_REVIEW_URL, clicksStore, cleanRef, normalizeSource, stampClick, clientKind, CLIENT_MAX } = require("./lib/reviews");
 
 exports.handler = async (event) => {
   const headers = {
@@ -56,6 +56,17 @@ exports.handler = async (event) => {
   const hv = (k) => String(h[k] || h[k.toLowerCase()] || "").toLowerCase();
   const navigational = hv("sec-fetch-mode") === "navigate" || hv("sec-fetch-dest") === "document";
 
+  // WHAT THEY TAPPED IT IN, because "why did only half of them post" cannot be answered
+  // without it. See clientKind in lib/reviews for the three competing explanations and why
+  // only one of them predicts a pattern here. The raw string is kept beside the verdict so
+  // the bucket can be checked against the original rather than believed.
+  //
+  // Deliberately NOT hashed or anonymised further: it is a browser string, it is already
+  // sent to every site the customer visits, and a truncated one that cannot be re-read is a
+  // measurement nobody can audit. Capped so a pathological UA cannot bloat the record.
+  const rawUA = String(h["user-agent"] || h["User-Agent"] || "");
+  const ua = rawUA.slice(0, CLIENT_MAX);
+
   // No ref, or a malformed one, is a legitimate call rather than an error — a bare /g means
   // "just take me to Google", which is what a page falls back to if it ever loses its ref.
   if (ref) {
@@ -66,6 +77,8 @@ exports.handler = async (event) => {
         // Carried through so the dashboard can say which button produced a click even when
         // the review row is slow to land, or never lands at all.
         source: normalizeSource(q.src),
+        client: clientKind(ua),
+        ua: ua,
       }, navigational));
     } catch (err) {
       // Logged, never surfaced. The customer is mid-hand-off.
