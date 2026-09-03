@@ -20,7 +20,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const {
-  buildFeed, containsPro, displayName, opaqueId,
+  buildFeed, containsPro, displayName, looksLikeCompany, opaqueId,
   proVariants, scrubComment, tidyCompany, toPublic,
 } = require('../netlify/functions/lib/public-reviews.js');
 
@@ -203,4 +203,43 @@ test('a malformed record is skipped, not published half-built', () => {
   assert.equal(toPublic({ id: 'z', rating: 'not a number', comment: 'hi' }), null);
   const feed = buildFeed([{ id: 'z', rating: null, comment: 'hi' }, ...FIXTURES]);
   assert.ok(feed.reviews.every((r) => Number.isFinite(r.rating)));
+});
+
+// ── THE CONSIGNEE FALLBACK IS NOT A HOLE IN THE SURNAME RULE ────────────────
+//
+// Found live: with the name box left blank the BOL consignee was published
+// verbatim, so a residential delivery put the customer's full name on a public,
+// CORS-open endpoint ("LINDA G MCDANIEL" -> "Linda G Mcdaniel"). "A surname is
+// never published in full" has to hold on this path too, and the consignee is a
+// person on every house delivery Davis makes.
+test("consignee that is a person is shortened like any other name", () => {
+  assert.equal(displayName("", "LINDA G MCDANIEL"), "Linda M.");
+  assert.equal(displayName("", "TRENT RILEY"), "Trent R.");
+  assert.equal(displayName("", "EMMA BISHOFF"), "Emma B.");
+});
+
+test("consignee that is a business still publishes in full", () => {
+  assert.equal(displayName("", "WESCO DISTRIBUTION"), "Wesco Distribution");
+  assert.equal(displayName("", "GWINNETT FIRE DEPT"), "Gwinnett Fire Dept");
+  assert.equal(displayName("", "TOP GARAGE"), "Top Garage");
+  assert.equal(displayName("", "M4 CONSTRUCTION"), "M4 Construction");
+});
+
+// A single token cannot be a "First Last" pair, so nothing is exposed by
+// publishing it whole — and it is what a one-word company looks like.
+test("a single-token consignee publishes whole", () => {
+  assert.equal(displayName("", "ULINE"), "Uline");
+});
+
+test("looksLikeCompany defaults to person when it recognises nothing", () => {
+  assert.equal(looksLikeCompany("TRENT RILEY"), false);
+  assert.equal(looksLikeCompany("LINDA G MCDANIEL"), false);
+  assert.equal(looksLikeCompany("WESCO DISTRIBUTION"), true);
+  // Punctuation must not hide the marker word.
+  assert.equal(looksLikeCompany("TABERNACLE CHURCH (UNITED MAINT)"), true);
+});
+
+// The whole point of the fallback ordering: a typed name still wins.
+test("a typed name still takes precedence over the consignee", () => {
+  assert.equal(displayName("Yvette Summerour", "WESCO DISTRIBUTION"), "Yvette S.");
 });
