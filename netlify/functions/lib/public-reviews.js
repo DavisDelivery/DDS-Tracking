@@ -50,19 +50,78 @@ function tidyCompany(raw) {
     .join(" ");
 }
 
-// The name shown publicly. A surname is never published in full.
+// "Yvette Summerour" -> "Yvette S.". A single token has no surname to hide.
+function shortenPerson(name) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]} ${parts[parts.length - 1].charAt(0).toUpperCase()}.`;
+}
+
+// Words that mark a consignee as a BUSINESS rather than a person.
+//
+// This list decides whether a name publishes in full, so it is deliberately
+// safe when incomplete: an unlisted company reads as "Peach State G.", which is
+// merely ugly. Defaulting the other way — treating an unrecognised consignee as
+// a company — publishes a residential customer's full name, which is the exact
+// thing this module exists to prevent. Davis delivers to houses as well as
+// businesses, so that is a common case, not a theoretical one.
+const COMPANY_WORDS = new Set([
+  // Legal forms
+  "LLC", "INC", "INCORPORATED", "LTD", "LIMITED", "CO", "CORP", "CORPORATION",
+  "COMPANY", "LP", "LLP", "PLLC", "PC", "GROUP", "HOLDINGS", "ENTERPRISES",
+  "PARTNERS", "ASSOCIATES", "TRUST", "FOUNDATION",
+  // What the business does
+  "DISTRIBUTION", "DISTRIBUTORS", "SUPPLY", "SUPPLIES", "SERVICES", "SERVICE",
+  "SOLUTIONS", "SYSTEMS", "INDUSTRIES", "INDUSTRIAL", "MANUFACTURING", "MFG",
+  "CONSTRUCTION", "CONTRACTING", "CONTRACTORS", "BUILDERS", "ELECTRIC",
+  "ELECTRICAL", "PLUMBING", "MECHANICAL", "HVAC", "ROOFING", "FLOORING",
+  "EQUIPMENT", "MACHINERY", "TOOL", "TOOLS", "PARTS", "PRODUCTS", "GOODS",
+  "WHOLESALE", "RETAIL", "STORE", "SHOP", "MARKET", "OUTLET", "WAREHOUSE",
+  "SALES", "RENTAL", "RENTALS", "LEASING", "LOGISTICS", "FREIGHT", "TRANSPORT",
+  "TRUCKING", "SHIPPING", "SUPPLYING", "SUPPLYCO",
+  // Places and institutions
+  "CHURCH", "TABERNACLE", "MINISTRIES", "SCHOOL", "ACADEMY", "COLLEGE",
+  "UNIVERSITY", "HOSPITAL", "CLINIC", "MEDICAL", "DENTAL", "PHARMACY",
+  "DEPT", "DEPARTMENT", "DISTRICT", "COUNTY", "CITY", "STATE", "FIRE",
+  "POLICE", "AUTHORITY", "AGENCY", "BUREAU", "OFFICE", "CENTER", "CENTRE",
+  "INSTITUTE", "LIBRARY", "MUSEUM", "PARK", "CLUB", "ASSOCIATION", "SOCIETY",
+  // Trades and premises
+  "GARAGE", "AUTO", "AUTOMOTIVE", "MOTORS", "TIRE", "COLLISION", "BODY",
+  "SALON", "SPA", "GYM", "FITNESS", "GOLF", "RESTAURANT", "CAFE", "GRILL",
+  "BAKERY", "BREWING", "FARM", "FARMS", "NURSERY", "LANDSCAPING", "PRINTING",
+  "PRINTER", "GRAPHICS", "SIGNS", "DESIGN", "STUDIO", "GALLERY", "PROPERTIES",
+  "REALTY", "REAL", "ESTATE", "APARTMENTS", "STORAGE", "LAUNDRY", "CLEANERS",
+  "MAINTENANCE", "MAINT", "REPAIR", "INSTALLATION", "ENERGY", "SOLAR",
+  "TECHNOLOGIES", "TECHNOLOGY", "TECH", "LABS", "LABORATORY", "PACKAGING",
+]);
+
+// Does this consignee read as a business? A single token counts: it cannot be a
+// "First Last" pair, so there is no surname exposed by publishing it whole.
+function looksLikeCompany(raw) {
+  const words = String(raw || "").toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+  if (!words.length) return false;
+  if (words.length === 1) return true;
+  return words.some((w) => COMPANY_WORDS.has(w));
+}
+
+// The name shown publicly. A surname is never published in full — and that has
+// to hold on the consignee fallback too, not just on the name the customer
+// typed. The BOL consignee is a PERSON on every residential delivery
+// ("LINDA G MCDANIEL", "TRENT RILEY"), so passing it straight through
+// published exactly the full names the rule above forbids.
 //   "Yvette Summerour"        -> "Yvette S."
 //   "Sean"                    -> "Sean"
-//   "" + "WESCO DISTRIBUTION" -> "Wesco Distribution"
+//   "" + "WESCO DISTRIBUTION" -> "Wesco Distribution"   (a business, in full)
+//   "" + "LINDA G MCDANIEL"   -> "Linda M."             (a person, shortened)
 //   nothing                   -> "Verified customer"
 function displayName(personal, company) {
   const p = (personal || "").trim();
-  if (p) {
-    const parts = p.split(/\s+/).filter(Boolean);
-    if (parts.length === 1) return parts[0];
-    return `${parts[0]} ${parts[parts.length - 1].charAt(0).toUpperCase()}.`;
-  }
-  return tidyCompany(company) || "Verified customer";
+  if (p) return shortenPerson(p);
+
+  const tidied = tidyCompany(company);
+  if (!tidied) return "Verified customer";
+  return looksLikeCompany(company) ? tidied : shortenPerson(tidied) || "Verified customer";
 }
 
 // Every punctuation-tolerant way a customer might write a given PRO.
@@ -176,9 +235,12 @@ function buildFeed(all, opts = {}) {
 module.exports = {
   DEFAULT_MIN_RATING,
   DEFAULT_MAX,
+  COMPANY_WORDS,
   buildFeed,
   containsPro,
   displayName,
+  looksLikeCompany,
+  shortenPerson,
   opaqueId,
   proVariants,
   scrubComment,
