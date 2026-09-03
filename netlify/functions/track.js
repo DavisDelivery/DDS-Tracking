@@ -169,6 +169,25 @@ function buildCandidates(raw) {
   const hyph = hyphenForm(raw);
   const alnum = normalizePro(raw);
 
+  // Dispatch suffixes a split shipment: 007150315-1 is its OWN stop, with its
+  // own delivery date, not an alias for 007150315. So the suffix rides along on
+  // every candidate and is never stripped to widen the search — dropping it
+  // would let a lookup for one half quietly answer with the other half's
+  // delivery, which is worse than finding nothing.
+  //
+  // Returning here also keeps the hyphen-stripped forms out: "7150315-1"
+  // flattened to "71503151" and re-padded to "071503151" is a nine-digit number
+  // that could belong to an entirely unrelated shipment.
+  const split = hyph.match(/^(\d+)(-[A-Z0-9-]+)$/);
+  if (split) {
+    const digits = split[1];
+    const suffix = split[2];
+    // Customers routinely drop the leading zeros, so the padded form leads.
+    if (digits.length < 9) add(digits.padStart(9, "0") + suffix);
+    add(hyph);
+    return out;
+  }
+
   if (/^\d+$/.test(alnum) && hyph === alnum) {
     // Purely numeric: the zero-padded nine-digit form is the Uline stop number,
     // so it has to lead — the unpadded form almost never exists.
