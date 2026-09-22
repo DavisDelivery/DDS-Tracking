@@ -1,4 +1,8 @@
 const fetch = require("node-fetch");
+const {
+  displayStatus: computeDisplayStatus,
+  readCancellation,
+} = require("./lib/stop-status");
 
 const BASE = "https://portal.nuvizz.com/deliverit/openapi/v7";
 
@@ -380,6 +384,41 @@ exports.handler = async (event) => {
 
     const rawStopStatus = exe.stopStatus || "";
 
+    // Key-gated diagnostic: NuVizz's stop execution block, untouched.
+    //
+    // "Why did this say that yesterday?" was unanswerable from here. The
+    // response this function builds is a deliberate subset — it drops the
+    // cancellation record, the exception detail and every status field the
+    // page does not render — so the one question worth asking about a status
+    // complaint could only be answered by reading the code and guessing.
+    // Placed BEFORE the load fetch so it answers for an unplanned stop too,
+    // which is exactly the state that prompted it.
+    //
+    // Returns NuVizz's own payload for one stop, to whoever holds the key.
+    // Same gate as the diagnostics already here — it exposes nothing the
+    // customer-facing response for that PRO does not already expose about the
+    // consignee, only more of what NuVizz recorded about the delivery itself.
+    if (debugOk && qsp.raw === "1") {
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify(
+          {
+            stopNbr,
+            company: companyCode,
+            resolvedBy: resolved.matched,
+            load: {
+              loadNbr: load.loadNbr || null,
+              keys: Object.keys(load || {}),
+            },
+            stopExecutionInfo: exe,
+          },
+          null,
+          2
+        ),
+      };
+    }
+
     // Always pull the load to (a) get the load-level status and (b) compute
     // how many delivery stops remain before this one. Individual stop status
     // lags reality (it only flips when the driver physically works the stop),
@@ -561,33 +600,24 @@ exports.handler = async (event) => {
     }
 
     // Compute the status the customer actually sees.
-    // NuVizz stop status codes (v7 docs): 50 = "Arrived at DropOff" — the
-    // driver is AT the customer's door, NOT an exception. Exceptions are a
-    // separate flag (exceptionPresent), never a status code.
+    //
+    // The rules live in lib/stop-status.js, pure and unit-tested, because this
+    // is the sentence the customer reads and it used to be decided by an inline
+    // chain that knew three of NuVizz's eight status codes. Everything it did
+    // not name — including 80, "unable to deliver" — fell through to
+    // "Scheduled". See that file for what each branch is for.
+    //
     // Display codes sent to the frontend:
     //   90 Delivered · 50 Exception · 45 Driver Arrived · 40 Out for Delivery
-    //   30 Scheduled
-    // A confirmed delivery time is the ground truth that the stop was worked,
-    // even when the status code wasn't set through the normal driver flow.
-    const confirmed = (exe.to && exe.to.confirmedDTTM) || "";
-    let displayStatus;
-    if (rawStopStatus === "90" || rawStopStatus === "91") {
-      // 90 = driver-confirmed delivered; 91 = manually completed by dispatch.
-      displayStatus = "90";
-    } else if (confirmed && !exe.exceptionPresent) {
-      // Safety net: any other completion path (e.g. status 80) that still
-      // stamped a delivery confirmation time counts as delivered.
-      displayStatus = "90";
-    } else if (exe.exceptionPresent) {
-      displayStatus = "50";
-    } else if (rawStopStatus === "50") {
-      displayStatus = "45";
-    } else if (rawStopStatus === "38" || (loadStatus === "40" && loadStarted)) {
-      // 38 = enroute to destination; otherwise infer from the rolling load.
-      displayStatus = "40";
-    } else {
-      displayStatus = "30";
-    }
+    //   30 Scheduled · 20 Cancelled · 10 Not Yet Scheduled
+    const onRoute = !!(load && load.loadNbr);
+    const cancellation = readCancellation(exe);
+    const displayStatus = computeDisplayStatus({
+      exe,
+      loadStatus,
+      loadStarted,
+      onRoute,
+    });
 
     // Resolve the ETA the customer is actually shown.
     //
@@ -652,10 +682,26 @@ exports.handler = async (event) => {
         rawStopStatus,
         loadStatus,
         loadStarted,
+        // Whether the stop is planned on a route right now. The page needs it
+        // to tell "we have your order and are scheduling it" apart from "a
+        // truck has it today", and lib/stop-status.js needs it to know that a
+        // cancellation from the route this freight came off last night has
+        // been superseded by this morning's plan.
+        onRoute,
         exceptionPresent: exe.exceptionPresent || false,
         exceptions: (exe.exceptions || []).map((e) => ({
           exceptionComments: e.exceptionComments || "",
         })),
+        // NuVizz's own cancellation record, or null. Sent so the page can say
+        // "cancelled" with a date behind it rather than leaving the customer
+        // to read it out of an exception comment.
+        cancellation: cancellation
+          ? {
+              at: cancellation.at,
+              reasonCode: cancellation.reasonCode,
+              reasonDesc: cancellation.reasonDesc,
+            }
+          : null,
         to: {
           etaDttm: exe.to?.etaDttm || "",
           confirmedDTTM: exe.to?.confirmedDTTM || "",
