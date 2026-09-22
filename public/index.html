@@ -104,8 +104,12 @@ function fEW(i){if(!i)return"—";try{var M=15*60000,r=function(t){return new Da
 // something honest rather than quoting a time in the past.
 if(e.getTime()<Date.now())return"Arriving soon";var f=function(t){return t.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"})};return f(s)+" – "+f(e)}catch{return i}}
 function fPh(p){if(!p)return"";var c=p.replace(/\D/g,"");return c.length===10?"("+c.slice(0,3)+") "+c.slice(3,6)+"-"+c.slice(6):p}
-function sL(c){return c==="90"?"Delivered":c==="45"?"Driver Arrived":c==="40"?"Out for Delivery":c==="50"?"Exception":"Scheduled"}
-function sC(c){return c==="90"?B.green:c==="45"?B.blue:c==="40"?B.accent:c==="50"?B.red:B.g400}
+// Display codes come from netlify/functions/lib/stop-status.js, which is where
+// NuVizz's eight status codes are turned into the five things worth saying.
+// Anything unrecognised still reads "Scheduled" so a page served from cache
+// before a deploy never renders a blank chip.
+function sL(c){return c==="90"?"Delivered":c==="45"?"Driver Arrived":c==="40"?"Out for Delivery":c==="50"?"Exception":c==="20"?"Cancelled":c==="10"?"Not Yet Scheduled":"Scheduled"}
+function sC(c){return c==="90"?B.green:c==="45"?B.blue:c==="40"?B.accent:c==="50"?B.red:c==="20"?B.g600:B.g400}
 function el(tag,attrs,children){
   var e=document.createElement(tag);
   if(attrs)Object.keys(attrs).forEach(function(k){if(k==="style"&&typeof attrs[k]==="object"){Object.assign(e.style,attrs[k])}else if(k==="className"){e.className=attrs[k]}else if(k.startsWith("on")){e.addEventListener(k.slice(2).toLowerCase(),attrs[k])}else{e.setAttribute(k,attrs[k])}});
@@ -191,7 +195,7 @@ function renderBody(){
 function renderResults(d){
   var frag=document.createDocumentFragment();
   var s=d.stop,exe=d.exe,st=exe.stopStatus;
-  var isDel=st==="90",isLive=st==="40",isExc=st==="50",isArr=st==="45";
+  var isDel=st==="90",isLive=st==="40",isExc=st==="50",isArr=st==="45",isCan=st==="20",isUns=st==="10";
   var addr=s.to.address,con=s.to.contact,docs=s.to.documents||[];
   var pod=docs.find(function(x){return x.documentType==="03"});
   var imgs=docs.filter(function(x){return x.documentType==="02"});
@@ -211,8 +215,20 @@ function renderResults(d){
     etaHtml='<div style="margin-top:12px"><div style="background:'+B.blue+'0a;padding:12px 14px;border-radius:8px;border:1px solid '+B.blue+'18"><div style="font-size:10px;font-weight:700;color:'+B.blue+';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Driver On Site</div><div style="font-size:13px;color:'+B.g800+';font-weight:500;line-height:1.4">Your driver has arrived at your location'+(exe.to.arrivalDTTM?' at '+fT(exe.to.arrivalDTTM):'')+'.</div></div></div>';
   }
   if(isExc){
-    var excMsg=(exe.exceptions&&exe.exceptions[0])?exe.exceptions[0].exceptionComments:"An issue occurred with this delivery.";
+    var excMsg=esc((exe.exceptions&&exe.exceptions[0]&&exe.exceptions[0].exceptionComments)||"An issue occurred with this delivery.");
     etaHtml='<div style="margin-top:12px"><div style="background:'+B.red+'08;padding:12px 14px;border-radius:8px;border:1px solid '+B.red+'18"><div style="font-size:10px;font-weight:700;color:'+B.red+';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Delivery Exception</div><div style="font-size:13px;color:'+B.g800+';font-weight:500;line-height:1.4;margin-bottom:10px">'+excMsg+'</div><a href="tel:6789263939" style="display:inline-flex;align-items:center;gap:6px;background:'+B.red+';color:#fff;padding:8px 16px;border-radius:8px;text-decoration:none;font-weight:700;font-size:12px">📞 Contact Us — (678) 926-3939</a></div></div>';
+  }
+  if(isCan){
+    // NuVizz recorded a cancellation against this stop and it is on no route.
+    // Said plainly, with the date, because the alternative the page used to
+    // offer was "Scheduled" — a truck that is never coming.
+    var canWhen=(exe.cancellation&&exe.cancellation.at)?" on "+fD(exe.cancellation.at):"";
+    etaHtml='<div style="margin-top:12px"><div style="background:'+B.g100+';padding:12px 14px;border-radius:8px;border:1px solid '+B.g200+'"><div style="font-size:10px;font-weight:700;color:'+B.g600+';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Delivery Cancelled</div><div style="font-size:13px;color:'+B.g800+';font-weight:500;line-height:1.4;margin-bottom:10px">This delivery was cancelled in our system'+canWhen+', so no driver is scheduled for it. If you were expecting it, please call us and we will look into it.</div><a href="tel:6789263939" style="display:inline-flex;align-items:center;gap:6px;background:'+B.dark+';color:#fff;padding:8px 16px;border-radius:8px;text-decoration:none;font-weight:700;font-size:12px">📞 Contact Us — (678) 926-3939</a></div></div>';
+  }
+  if(isUns){
+    // Received, not yet planned onto a route. This used to read "Scheduled"
+    // under an empty arrival time, which promises a day nobody has picked yet.
+    etaHtml='<div style="margin-top:12px"><div style="background:'+B.light+';padding:12px 14px;border-radius:8px;border:1px solid '+B.g200+'"><div style="font-size:10px;font-weight:700;color:'+B.blue+';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Order Received</div><div style="font-size:13px;color:'+B.g800+';font-weight:500;line-height:1.4">We have your shipment. It has not been assigned to a delivery route yet — an estimated arrival time will appear here as soon as it is scheduled.</div></div></div>';
   }
   sc.innerHTML=topRow+etaHtml;
   statusCard.appendChild(sc);
